@@ -73,7 +73,7 @@ class ComposerProxyHandler implements RequestHandler {
 
             $package = 'Unknown'; $version = 'N/A';
             if (preg_match('#p2/([^/]+/[^/]+)(?:~([^/\.]+))?\.json#', $row['url'], $m)) {
-                $package = $m[1]; $version = $m[2] ?: 'any';
+                $package = $m[1]; $version = $m[2] ?? 'any';
             } elseif (preg_match('#/d/([^/]+/[^/]+)/([^/]+)#', $row['url'], $m)) {
                 // Packagist v2 использует /d/vendor/package/hash.zip
                 $package = $m[1]; $version = $m[2];

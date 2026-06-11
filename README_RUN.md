@@ -1,3 +1,12 @@
+```shell
+
+php setup_database.php ./config.php
+
+php server.php
+
+```
+
+
 ```
 server {
     listen 80;

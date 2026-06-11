@@ -52,6 +52,11 @@ class ComposerProxyHandler implements RequestHandler {
             return $this->handleStats($request);
         }
 
+        // Новый маршрут для скачивания архивов через прокси
+        if ($path === '/proxy') {
+            return $this->handleProxyDownload($request);
+        }
+
         return $this->handleProxy($request);
     }
 
@@ -75,17 +80,15 @@ class ComposerProxyHandler implements RequestHandler {
             if (preg_match('#p2/([^/]+/[^/]+)(?:~([^/\.]+))?\.json#', $row['url'], $m)) {
                 $package = $m[1]; $version = $m[2] ?? 'any';
             } elseif (preg_match('#/d/([^/]+/[^/]+)/([^/]+)#', $row['url'], $m)) {
-                // Packagist v2 использует /d/vendor/package/hash.zip
                 $package = $m[1]; $version = $m[2];
-            } elseif (preg_match('#dist/([^/]+/[^/]+)/([^/]+)#', $row['url'], $m)) {
-                // Старый формат
-                $package = $m[1]; $version = $m[2];
+            } elseif (preg_match('#api\.github\.com/repos/([^/]+/[^/]+)/zipball/#', $row['url'], $m)) {
+                $package = $m[1]; $version = 'archive';
             }
 
             $rows[] = [
                 'package' => htmlspecialchars($package),
                 'version' => htmlspecialchars($version),
-                'type' => str_contains($row['url'], '.zip') ? '📦 Archive' : '📄 Metadata',
+                'type' => str_contains($row['url'], '.zip') || str_contains($row['url'], 'api.github.com') ? '📦 Archive' : '📄 Metadata',
                 'size' => $size,
                 'created' => date('Y-m-d H:i', $row['created_at']),
                 'accessed' => date('Y-m-d H:i', $row['last_accessed_at']),
@@ -114,59 +117,50 @@ class ComposerProxyHandler implements RequestHandler {
         $path = $uri->getPath();
         $targetUrl = str_starts_with($path, 'http') ? $path : rtrim($this->config['default_upstream'], '/') . $path;
 
-        // 1. Проверка кэша (Future->await() - единственный способ в v3)
-        $cacheFuture = async(function () use ($targetUrl) {
-            $stmt = $this->pdo->prepare("SELECT file_path, content_type, expires_at FROM cache_entries WHERE url = :url");
-            $stmt->execute(['url' => $targetUrl]);
-            return $stmt->fetch();
-        });
-        $cacheRow = $cacheFuture->await();
-
-        $isHit = $cacheRow && time() < $cacheRow['expires_at'] && file_exists($cacheRow['file_path']);
-
-        if ($isHit) {
-            async(function () use ($targetUrl) {
-                $stmt = $this->pdo->prepare("UPDATE cache_entries SET last_accessed_at = :time WHERE url = :url");
-                $stmt->execute(['time' => time(), 'url' => $targetUrl]);
+        try {
+            $cacheFuture = async(function () use ($targetUrl) {
+                $stmt = $this->pdo->prepare("SELECT file_path, content_type, expires_at FROM cache_entries WHERE url = :url");
+                $stmt->execute(['url' => $targetUrl]);
+                return $stmt->fetch();
             });
+            $cacheRow = $cacheFuture->await();
 
-            // openFile возвращает объект File (реализует ReadableStream)
-            /** @var File $file */
-            $file = openFile($cacheRow['file_path'], 'r');
-            return new Response(200, [
-                'content-type' => $cacheRow['content_type'] ?: 'application/octet-stream',
-                'x-cache-status' => 'HIT',
-            ], $file);
-        }
+            $isHit = $cacheRow && time() < $cacheRow['expires_at'] && file_exists($cacheRow['file_path']);
 
-        $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
-        $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
+            if ($isHit) {
+                async(function () use ($targetUrl) {
+                    $stmt = $this->pdo->prepare("UPDATE cache_entries SET last_accessed_at = :time WHERE url = :url");
+                    $stmt->execute(['time' => time(), 'url' => $targetUrl]);
+                });
 
-        $clientRequest = new ClientRequest($targetUrl);
-        $clientRequest->setHeader('User-Agent', 'Composer-Proxy/1.0');
+                // Читаем файл и модифицируем JSON на лету
+                $content = file_get_contents($cacheRow['file_path']);
+                if (str_contains($cacheRow['content_type'] ?? '', 'application/json')) {
+                    $content = $this->rewriteJsonUrls($content, $request);
+                }
 
-        $upstreamResponse = $this->httpClient->request($clientRequest);
-        $status = $upstreamResponse->getStatus();
-        $contentType = $upstreamResponse->getHeader('content-type') ?: 'application/octet-stream';
+                return new Response(200, [
+                    'content-type' => $cacheRow['content_type'] ?: 'application/octet-stream',
+                    'x-cache-status' => 'HIT',
+                ], $content);
+            }
 
-        if ($status === 200) {
-            $body = $upstreamResponse->getBody();
+            $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
+            $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
 
-            // Логирование: куда пытаемся писать
-            fwrite(STDERR, "[DEBUG] Attempting to cache: {$targetUrl}\n");
-            fwrite(STDERR, "[DEBUG] Temp path: {$tempPath}\n");
-            fwrite(STDERR, "[DEBUG] Final path: {$finalPath}\n");
-            fwrite(STDERR, "[DEBUG] Cache dir writable: " . (is_writable($this->config['cache_dir']) ? 'YES' : 'NO') . "\n");
+            fwrite(STDERR, "[DEBUG] MISS: {$targetUrl}\n");
 
-            // openFile синхронно возвращает объект File
-            /** @var File $file */
-            try {
-                // openFile возвращает объект File напрямую
-                /** @var File $file */
+            $clientRequest = new ClientRequest($targetUrl);
+            $clientRequest->setHeader('User-Agent', 'Composer-Proxy/1.0');
+
+            $upstreamResponse = $this->httpClient->request($clientRequest);
+            $status = $upstreamResponse->getStatus();
+            $contentType = $upstreamResponse->getHeader('content-type') ?: 'application/octet-stream';
+
+            if ($status === 200) {
+                $body = $upstreamResponse->getBody();
                 $file = openFile($tempPath, 'w');
 
-                // В AMPHP v3 методы потоков (read/write) возвращают результат напрямую через Fiber.
-                // ->await() вызывать НЕ нужно. read() вернет строку или null.
                 $bytesWritten = 0;
                 while (($chunk = $body->read()) !== null) {
                     $file->write($chunk);
@@ -174,48 +168,197 @@ class ComposerProxyHandler implements RequestHandler {
                 }
                 $file->close();
 
-                fwrite(STDERR, "[DEBUG] Downloaded {$bytesWritten} bytes to temp file\n");
+                rename($tempPath, $finalPath);
+                fwrite(STDERR, "[DEBUG] Cached {$bytesWritten} bytes to {$finalPath}\n");
 
-                if (!rename($tempPath, $finalPath)) {
-                    fwrite(STDERR, "[ERROR] Failed to rename {$tempPath} to {$finalPath}\n");
-                } else {
-                    fwrite(STDERR, "[DEBUG] Successfully cached to {$finalPath}\n");
-                }
-            } catch (\Throwable $e) {
-                fwrite(STDERR, "[ERROR] Failed to write cache file: " . $e->getMessage() . "\n");
-                fwrite(STDERR, $e->getTraceAsString() . "\n");
-                throw $e;
-            }
+                $isArchive = str_contains($targetUrl, '.zip') || str_contains($targetUrl, '.tar') || str_contains($targetUrl, 'codeload.github.com');
+                $ttl = $isArchive ? $this->config['archive_ttl'] : $this->config['default_ttl'];
+                $now = time();
 
-            $isArchive = str_contains($targetUrl, '.zip') || str_contains($targetUrl, '.tar') || str_contains($targetUrl, 'codeload.github.com');
-            $ttl = $isArchive ? $this->config['archive_ttl'] : $this->config['default_ttl'];
-            $now = time();
-
-            async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now) {
-                try {
-                    fwrite(STDERR, "[DEBUG] Saving to database: {$targetUrl}\n");
+                async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now) {
                     $stmt = $this->pdo->prepare("REPLACE INTO cache_entries (url, file_path, content_type, expires_at, created_at, last_accessed_at) VALUES (:url, :path, :ct, :exp, :now, :now)");
                     $stmt->execute([
                         'url' => $targetUrl, 'path' => $finalPath, 'ct' => $contentType,
                         'exp' => $now + $ttl, 'now' => $now
                     ]);
-                    fwrite(STDERR, "[DEBUG] Database entry created successfully\n");
-                } catch (\Throwable $e) {
-                    fwrite(STDERR, "[ERROR] Database write failed: " . $e->getMessage() . "\n");
-                }
-            });
+                });
 
-            /** @var File $outFile */
-            $outFile = openFile($finalPath, 'r');
-            return new Response(200, [
-                'content-type' => $contentType,
-                'x-cache-status' => 'MISS',
-            ], $outFile);
-        } else {
-            if (file_exists($tempPath)) {
-                unlink($tempPath);
+                // Читаем файл и модифицируем JSON на лету
+                $content = file_get_contents($finalPath);
+                if (str_contains($contentType, 'application/json')) {
+                    $content = $this->rewriteJsonUrls($content, $request);
+                }
+
+                return new Response(200, [
+                    'content-type' => $contentType,
+                    'x-cache-status' => 'MISS',
+                ], $content);
+            } else {
+                if (file_exists($tempPath)) unlink($tempPath);
+                return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
             }
-            return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[FATAL ERROR] " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+            return new Response(500, ['content-type' => 'text/plain'], "Proxy Error: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Обработчик скачивания архивов через прокси
+     * Вызывается когда Composer запрашивает URL вида: /proxy?url=https://api.github.com/...
+     */
+    private function handleProxyDownload(Request $request): Response {
+        parse_str($request->getUri()->getQuery(), $queryParams);
+        $targetUrl = $queryParams['url'] ?? '';
+
+        if (!$targetUrl) {
+            return new Response(400, ['content-type' => 'text/plain'], 'Missing url parameter');
+        }
+
+        fwrite(STDERR, "[DEBUG] Proxy download request: {$targetUrl}\n");
+
+        try {
+            // Проверяем кэш
+            $cacheFuture = async(function () use ($targetUrl) {
+                $stmt = $this->pdo->prepare("SELECT file_path, content_type, expires_at FROM cache_entries WHERE url = :url");
+                $stmt->execute(['url' => $targetUrl]);
+                return $stmt->fetch();
+            });
+            $cacheRow = $cacheFuture->await();
+
+            $isHit = $cacheRow && time() < $cacheRow['expires_at'] && file_exists($cacheRow['file_path']);
+
+            if ($isHit) {
+                async(function () use ($targetUrl) {
+                    $stmt = $this->pdo->prepare("UPDATE cache_entries SET last_accessed_at = :time WHERE url = :url");
+                    $stmt->execute(['time' => time(), 'url' => $targetUrl]);
+                });
+
+                fwrite(STDERR, "[DEBUG] Archive HIT: {$targetUrl}\n");
+                $file = openFile($cacheRow['file_path'], 'r');
+                return new Response(200, [
+                    'content-type' => $cacheRow['content_type'] ?: 'application/octet-stream',
+                    'x-cache-status' => 'HIT',
+                ], $file);
+            }
+
+            // Скачиваем архив
+            fwrite(STDERR, "[DEBUG] Archive MISS: {$targetUrl}\n");
+            $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
+            $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
+
+            $clientRequest = new ClientRequest($targetUrl);
+            $clientRequest->setHeader('User-Agent', 'Composer-Proxy/1.0');
+
+            $upstreamResponse = $this->httpClient->request($clientRequest);
+            $status = $upstreamResponse->getStatus();
+            $contentType = $upstreamResponse->getHeader('content-type') ?: 'application/zip';
+
+            if ($status === 200) {
+                $body = $upstreamResponse->getBody();
+                $file = openFile($tempPath, 'w');
+
+                $bytesWritten = 0;
+                while (($chunk = $body->read()) !== null) {
+                    $file->write($chunk);
+                    $bytesWritten += strlen($chunk);
+                }
+                $file->close();
+
+                rename($tempPath, $finalPath);
+                fwrite(STDERR, "[DEBUG] Downloaded {$bytesWritten} bytes to {$finalPath}\n");
+
+                $ttl = $this->config['archive_ttl'];
+                $now = time();
+
+                async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now) {
+                    $stmt = $this->pdo->prepare("REPLACE INTO cache_entries (url, file_path, content_type, expires_at, created_at, last_accessed_at) VALUES (:url, :path, :ct, :exp, :now, :now)");
+                    $stmt->execute([
+                        'url' => $targetUrl, 'path' => $finalPath, 'ct' => $contentType,
+                        'exp' => $now + $ttl, 'now' => $now
+                    ]);
+                });
+
+                $outFile = openFile($finalPath, 'r');
+                return new Response(200, [
+                    'content-type' => $contentType,
+                    'x-cache-status' => 'MISS',
+                ], $outFile);
+            } else {
+                if (file_exists($tempPath)) unlink($tempPath);
+                return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
+            }
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[FATAL ERROR in handleProxyDownload] " . $e->getMessage() . "\n");
+            return new Response(500, ['content-type' => 'text/plain'], "Proxy Download Error: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Переписывает URL в JSON-метаданных, заменяя прямые ссылки на GitHub
+     * на ссылки через наш прокси
+     */
+    /**
+     * Переписывает URL в JSON-метаданных
+     */
+    private function rewriteJsonUrls(string $content, Request $request): string {
+        $data = json_decode($content, true);
+        if (!$data) {
+            fwrite(STDERR, "[DEBUG] JSON decode failed\n");
+            return $content;
+        }
+
+        $baseUrl = $request->getUri()->getScheme() . '://' . $request->getUri()->getAuthority();
+        $replacedCount = 0;
+
+        // КРИТИЧНО: Переписываем metadata-url в packages.json
+        // Это заставляет Composer запрашивать все метаданные через прокси
+        if (isset($data['metadata-url']) && is_string($data['metadata-url'])) {
+            $original = $data['metadata-url'];
+            // Заменяем домен Packagist на наш прокси
+            $data['metadata-url'] = preg_replace(
+                '#https?://[^/]+#',
+                $baseUrl,
+                $original
+            );
+            if ($data['metadata-url'] !== $original) {
+                fwrite(STDERR, "[DEBUG] Rewrote metadata-url: {$original} -> {$data['metadata-url']}\n");
+                $replacedCount++;
+            }
+        }
+
+        // Также переписываем другие URL в packages.json
+        $urlFields = ['providers-url', 'metadata-changes-url', 'search', 'list', 'providers-api'];
+        foreach ($urlFields as $field) {
+            if (isset($data[$field]) && is_string($data[$field])) {
+                $original = $data[$field];
+                $data[$field] = preg_replace('#https?://[^/]+#', $baseUrl, $original);
+                if ($data[$field] !== $original) {
+                    $replacedCount++;
+                }
+            }
+        }
+
+        // Рекурсивно переписываем URL архивов (api.github.com, codeload.github.com)
+        $this->rewriteUrlsRecursive($data, $baseUrl, $replacedCount);
+
+        if ($replacedCount > 0) {
+            fwrite(STDERR, "[DEBUG] Total rewritten: {$replacedCount} URLs\n");
+        }
+
+        return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+
+    private function rewriteUrlsRecursive(mixed &$data, string $baseUrl, int &$count): void {
+        if (is_array($data)) {
+            foreach ($data as &$value) {
+                $this->rewriteUrlsRecursive($value, $baseUrl, $count);
+            }
+        } elseif (is_string($data)) {
+            if (str_contains($data, 'api.github.com') || str_contains($data, 'codeload.github.com')) {
+                $data = $baseUrl . '/proxy?url=' . urlencode($data);
+                $count++;
+            }
         }
     }
 }
@@ -244,30 +387,21 @@ $consoleLogger = new class implements LoggerInterface {
     }
 };
 
-// 1. Создаем экземпляр сервера напрямую
+// --- Запуск сервера ---
 $server = new SocketHttpServer(
     $consoleLogger,
     new \Amp\Socket\ResourceServerSocketFactory(),
     new Amp\Http\Server\Driver\SocketClientFactory(new NullLogger())
 );
+
 $server->expose($config['listen']);
 
 $errorHandler = new DefaultErrorHandler();
 $handler = new ComposerProxyHandler($pdo, $httpClient, $config);
 
-// В v3 метод start() вызывается напрямую на экземпляре SocketHttpServer
+echo "🚀 Starting Composer Proxy on {$config['listen']}...\n";
 $server->start($handler, $errorHandler);
 
-echo "🚀 Starting Composer Proxy on {$config['listen']}...\n";
-
-$signals = [];
-if (defined('SIGINT')) $signals[] = SIGINT;
-if (defined('SIGTERM')) $signals[] = SIGTERM;
-if (empty($signals)) {
-    // Fallback для систем без pcntl
-    $signals = [2, 15];
-}
-trapSignal($signals);
-
+trapSignal([2, 15]); // SIGINT, SIGTERM
 echo "\n🛑 Shutting down gracefully...\n";
 $server->stop();

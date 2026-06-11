@@ -7,6 +7,8 @@
         }
     ],
     "require": {
+        "php": "^8.2",
+        "ext-pcntl": "*",
         "amphp/amp": "^3",
         "amphp/http-server": "^3",
         "amphp/http-server-router": "^2",

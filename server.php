@@ -535,6 +535,6 @@ $handler = new ComposerProxyHandler($pdo, $httpClient, $config);
 echo "🚀 Starting Composer Proxy on {$config['listen']}...\n";
 $server->start($handler, $errorHandler);
 
-trapSignal([2, 15]); // SIGINT, SIGTERM
+trapSignal([SIGINT, SIGTERM]); // SIGINT, SIGTERM
 echo "\n🛑 Shutting down gracefully...\n";
 $server->stop();

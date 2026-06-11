@@ -160,6 +160,7 @@ class ComposerProxyHandler implements RequestHandler {
         $targetUrl = str_starts_with($path, 'http') ? $path : rtrim($this->config['default_upstream'], '/') . $path;
 
         try {
+            // 1. Проверка кэша
             $cacheFuture = async(function () use ($targetUrl) {
                 $stmt = $this->pdo->prepare("SELECT file_path, content_type, expires_at FROM cache_entries WHERE url = :url");
                 $stmt->execute(['url' => $targetUrl]);
@@ -170,13 +171,15 @@ class ComposerProxyHandler implements RequestHandler {
             $isHit = $cacheRow && time() < $cacheRow['expires_at'] && file_exists($cacheRow['file_path']);
 
             if ($isHit) {
+                // Обновляем время последнего доступа
                 async(function () use ($targetUrl) {
                     $stmt = $this->pdo->prepare("UPDATE cache_entries SET last_accessed_at = :time WHERE url = :url");
                     $stmt->execute(['time' => time(), 'url' => $targetUrl]);
                 });
 
-                // Читаем файл и модифицируем JSON на лету
                 $content = file_get_contents($cacheRow['file_path']);
+
+                // Если это JSON, переписываем URL внутри
                 if (str_contains($cacheRow['content_type'] ?? '', 'application/json')) {
                     $content = $this->rewriteJsonUrls($content, $request);
                 }
@@ -187,11 +190,9 @@ class ComposerProxyHandler implements RequestHandler {
                 ], $content);
             }
 
-            // $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
-            // $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
-
             fwrite(STDERR, "[DEBUG] MISS: {$targetUrl}\n");
 
+            // 2. Скачивание с upstream
             $clientRequest = new ClientRequest($targetUrl);
             $clientRequest->setHeader('User-Agent', 'Composer-Proxy/1.0');
 
@@ -202,19 +203,19 @@ class ComposerProxyHandler implements RequestHandler {
             if ($status === 200) {
                 $body = $upstreamResponse->getBody();
 
-                // Определяем тип и путь
+                // Определяем тип контента для формирования пути
                 $type = str_contains($contentType, 'application/json') ? 'metadata' : 'archive';
                 $finalPath = $this->getCachePath($targetUrl, $type);
                 $tempPath = $finalPath . '.tmp';
 
-                // Создаём директорию
+                // Создаём иерархию директорий
                 $dir = dirname($finalPath);
                 if (!is_dir($dir)) {
                     mkdir($dir, 0755, true);
                 }
 
+                // Стримим на диск
                 $file = openFile($tempPath, 'w');
-
                 $bytesWritten = 0;
                 while (($chunk = $body->read()) !== null) {
                     $file->write($chunk);
@@ -225,6 +226,57 @@ class ComposerProxyHandler implements RequestHandler {
                 rename($tempPath, $finalPath);
                 fwrite(STDERR, "[DEBUG] Cached {$bytesWritten} bytes to {$finalPath}\n");
 
+                // 3. КРИТИЧНО: Если это метаданные, парсим их и сохраняем маппинг архивов
+                if ($type === 'metadata') {
+                    $jsonContent = file_get_contents($finalPath);
+                    $metadata = json_decode($jsonContent, true);
+
+                    if ($metadata) {
+                        $vendorPackage = null;
+
+                        // Пытаемся получить vendor/package из URL (например, /p2/vendor/package.json)
+                        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~[^/]+)?\.json#', $targetUrl, $m)) {
+                            $vendorPackage = $m[1] . '/' . $m[2];
+                        }
+
+                        // Если не получилось из URL, берём из первой записи в packages
+                        if (!$vendorPackage && isset($metadata['packages'])) {
+                            $firstPackage = reset($metadata['packages']);
+                            if (is_array($firstPackage) && !empty($firstPackage)) {
+                                $firstVersion = reset($firstPackage);
+                                $vendorPackage = $firstVersion['name'] ?? null;
+                            }
+                        }
+
+                        // Если имя пакета определено, сохраняем маппинг всех его архивов
+                        if ($vendorPackage && isset($metadata['packages'])) {
+                            async(function () use ($metadata, $vendorPackage) {
+                                try {
+                                    $stmt = $this->pdo->prepare("INSERT OR REPLACE INTO archive_mapping (archive_url, vendor_package) VALUES (:url, :pkg)");
+
+                                    foreach ($metadata['packages'] as $packageName => $versions) {
+                                        if (!is_array($versions)) continue;
+
+                                        foreach ($versions as $version => $versionData) {
+                                            if (!is_array($versionData) || !isset($versionData['dist']['url'])) continue;
+
+                                            $archiveUrl = $versionData['dist']['url'];
+                                            $stmt->execute([
+                                                'url' => $archiveUrl,
+                                                'pkg' => $vendorPackage
+                                            ]);
+                                        }
+                                    }
+                                    fwrite(STDERR, "[DEBUG] Saved archive mappings for {$vendorPackage}\n");
+                                } catch (\Throwable $e) {
+                                    fwrite(STDERR, "[DEBUG] Failed to save archive mapping: " . $e->getMessage() . "\n");
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // 4. Сохраняем запись о файле в основную таблицу кэша
                 $isArchive = $type === 'archive';
                 $ttl = $isArchive ? $this->config['archive_ttl'] : $this->config['default_ttl'];
                 $now = time();
@@ -237,7 +289,7 @@ class ComposerProxyHandler implements RequestHandler {
                     ]);
                 });
 
-                // Читаем файл и модифицируем JSON на лету
+                // 5. Формируем ответ (с переписанными URL для JSON)
                 $content = file_get_contents($finalPath);
                 if (str_contains($contentType, 'application/json')) {
                     $content = $this->rewriteJsonUrls($content, $request);
@@ -248,11 +300,14 @@ class ComposerProxyHandler implements RequestHandler {
                     'x-cache-status' => 'MISS',
                 ], $content);
             } else {
-                if (file_exists($tempPath ?? '')) unlink($tempPath);
+                // Ошибка upstream
+                if (isset($tempPath) && file_exists($tempPath)) {
+                    unlink($tempPath);
+                }
                 return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
             }
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[FATAL ERROR] " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+            fwrite(STDERR, "[FATAL ERROR in handleProxy] " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
             return new Response(500, ['content-type' => 'text/plain'], "Proxy Error: " . $e->getMessage());
         }
     }
@@ -296,10 +351,34 @@ class ComposerProxyHandler implements RequestHandler {
                 ], $file);
             }
 
-            // Скачиваем архив
             fwrite(STDERR, "[DEBUG] Archive MISS: {$targetUrl}\n");
 
-            $finalPath = $this->getCachePath($targetUrl, 'archive');
+            // ПРОВЕРЯЕМ МАППИНГ: получаем composer-имя пакета для этого URL архива
+            $mappingFuture = async(function () use ($targetUrl) {
+                $stmt = $this->pdo->prepare("SELECT vendor_package FROM archive_mapping WHERE archive_url = :url");
+                $stmt->execute(['url' => $targetUrl]);
+                return $stmt->fetchColumn();
+            });
+            $vendorPackage = $mappingFuture->await();
+
+            // Формируем путь с учётом маппинга
+            if ($vendorPackage) {
+                // Извлекаем хеш из URL
+                $hash = null;
+                if (preg_match('#/(?:zipball|legacy\.zip)/([^/]+)#', $targetUrl, $m)) {
+                    $hash = $m[1];
+                } else {
+                    $hash = md5($targetUrl);
+                }
+
+                $finalPath = $this->config['cache_dir'] . '/' . $vendorPackage . '/' . $hash . '.zip';
+                fwrite(STDERR, "[DEBUG] Using mapping: {$targetUrl} -> {$vendorPackage}\n");
+            } else {
+                // Если маппинга нет, используем стандартный путь
+                $finalPath = $this->getCachePath($targetUrl, 'archive');
+                fwrite(STDERR, "[DEBUG] No mapping found, using default path\n");
+            }
+
             $tempPath = $finalPath . '.tmp';
 
             $dir = dirname($finalPath);

@@ -49,6 +49,13 @@ try {
         )
     ");
 
+    $pdo->exec("
+    CREATE TABLE IF NOT EXISTS archive_mapping (
+        archive_url TEXT PRIMARY KEY,
+        vendor_package TEXT NOT NULL
+    )
+    ");
+
     // Миграция: добавляем колонки, если обновляемся со старой версии
     $columns = $pdo->query("PRAGMA table_info(cache_entries)")->fetchAll(PDO::FETCH_COLUMN, 1);
     if (!in_array('created_at', $columns, true)) {
@@ -56,6 +63,16 @@ try {
     }
     if (!in_array('last_accessed_at', $columns, true)) {
         $pdo->exec("ALTER TABLE cache_entries ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT " . time());
+    }
+
+    $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='archive_mapping'")->fetch();
+    if (!$tables) {
+        $pdo->exec("
+        CREATE TABLE IF NOT EXISTS archive_mapping (
+            archive_url TEXT PRIMARY KEY,
+            vendor_package TEXT NOT NULL
+        )
+    ");
     }
 
     echo "Database initialized successfully at: {$config['db_path']}\n";

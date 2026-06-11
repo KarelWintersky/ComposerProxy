@@ -81,14 +81,14 @@ class ComposerProxyHandler implements RequestHandler {
                 $package = $m[1]; $version = $m[2] ?? 'any';
             } elseif (preg_match('#/d/([^/]+/[^/]+)/([^/]+)#', $row['url'], $m)) {
                 $package = $m[1]; $version = $m[2];
-            } elseif (preg_match('#api\.github\.com/repos/([^/]+/[^/]+)/zipball/#', $row['url'], $m)) {
-                $package = $m[1]; $version = 'archive';
+            } elseif (preg_match('#api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)#', $row['url'], $m)) {
+                $package = $m[1] . '/' . $m[2]; $version = substr($m[3], 0, 8);
             }
 
             $rows[] = [
                 'package' => htmlspecialchars($package),
                 'version' => htmlspecialchars($version),
-                'type' => str_contains($row['url'], '.zip') || str_contains($row['url'], 'api.github.com') ? '📦 Archive' : '📄 Metadata',
+                'type' => str_contains($row['file_path'], '.zip') ? '📦 Archive' : '📄 Metadata',
                 'size' => $size,
                 'created' => date('Y-m-d H:i', $row['created_at']),
                 'accessed' => date('Y-m-d H:i', $row['last_accessed_at']),
@@ -110,6 +110,48 @@ class ComposerProxyHandler implements RequestHandler {
         $html .= "</table></body></html>";
 
         return new Response(200, ['content-type' => 'text/html; charset=utf-8'], $html);
+    }
+
+    /**
+     * Извлекает vendor/package из URL и формирует путь к файлу
+     */
+    private function getCachePath(string $url, string $type): string {
+        $vendor = 'unknown';
+        $package = 'unknown';
+        $hash = null;
+
+        // Для метаданных: https://repo.packagist.org/p2/vendor/package.json
+        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~[^/]+)?\.json#', $url, $m)) {
+            $vendor = $m[1];
+            $package = $m[2];
+        }
+        // Для архивов Packagist: https://repo.packagist.org/d/vendor/package/hash.zip
+        elseif (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
+            $vendor = $m[1];
+            $package = $m[2];
+            $hash = $m[3];
+        }
+        // Для архивов GitHub: https://api.github.com/repos/vendor/package/zipball/hash
+        elseif (preg_match('#api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)#', $url, $m)) {
+            $vendor = $m[1];
+            $package = $m[2];
+            $hash = $m[3];
+        }
+        // Для архивов GitHub (codeload): https://codeload.github.com/vendor/package/legacy.zip/hash
+        elseif (preg_match('#codeload\.github\.com/([^/]+)/([^/]+)/legacy\.zip/([^/]+)#', $url, $m)) {
+            $vendor = $m[1];
+            $package = $m[2];
+            $hash = $m[3];
+        }
+
+        // Формируем путь
+        if ($type === 'metadata') {
+            // cache/vendor/package/package.json
+            return $this->config['cache_dir'] . '/' . $vendor . '/' . $package . '/package.json';
+        } else {
+            // cache/vendor/package/hash.zip
+            return $this->config['cache_dir'] . '/' . $vendor . '/' . $package . '/' . $hash . '.zip';
+        }
     }
 
     private function handleProxy(Request $request): Response {
@@ -145,8 +187,8 @@ class ComposerProxyHandler implements RequestHandler {
                 ], $content);
             }
 
-            $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
-            $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
+            // $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
+            // $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
 
             fwrite(STDERR, "[DEBUG] MISS: {$targetUrl}\n");
 
@@ -159,6 +201,18 @@ class ComposerProxyHandler implements RequestHandler {
 
             if ($status === 200) {
                 $body = $upstreamResponse->getBody();
+
+                // Определяем тип и путь
+                $type = str_contains($contentType, 'application/json') ? 'metadata' : 'archive';
+                $finalPath = $this->getCachePath($targetUrl, $type);
+                $tempPath = $finalPath . '.tmp';
+
+                // Создаём директорию
+                $dir = dirname($finalPath);
+                if (!is_dir($dir)) {
+                    mkdir($dir, 0755, true);
+                }
+
                 $file = openFile($tempPath, 'w');
 
                 $bytesWritten = 0;
@@ -171,7 +225,7 @@ class ComposerProxyHandler implements RequestHandler {
                 rename($tempPath, $finalPath);
                 fwrite(STDERR, "[DEBUG] Cached {$bytesWritten} bytes to {$finalPath}\n");
 
-                $isArchive = str_contains($targetUrl, '.zip') || str_contains($targetUrl, '.tar') || str_contains($targetUrl, 'codeload.github.com');
+                $isArchive = $type === 'archive';
                 $ttl = $isArchive ? $this->config['archive_ttl'] : $this->config['default_ttl'];
                 $now = time();
 
@@ -194,7 +248,7 @@ class ComposerProxyHandler implements RequestHandler {
                     'x-cache-status' => 'MISS',
                 ], $content);
             } else {
-                if (file_exists($tempPath)) unlink($tempPath);
+                if (file_exists($tempPath ?? '')) unlink($tempPath);
                 return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
             }
         } catch (\Throwable $e) {
@@ -244,8 +298,14 @@ class ComposerProxyHandler implements RequestHandler {
 
             // Скачиваем архив
             fwrite(STDERR, "[DEBUG] Archive MISS: {$targetUrl}\n");
-            $tempPath = $this->config['cache_dir'] . '/' . md5($targetUrl) . '.tmp';
-            $finalPath = $this->config['cache_dir'] . '/' . md5($targetUrl);
+
+            $finalPath = $this->getCachePath($targetUrl, 'archive');
+            $tempPath = $finalPath . '.tmp';
+
+            $dir = dirname($finalPath);
+            if (!is_dir($dir)) {
+                mkdir($dir, 0755, true);
+            }
 
             $clientRequest = new ClientRequest($targetUrl);
             $clientRequest->setHeader('User-Agent', 'Composer-Proxy/1.0');
@@ -311,23 +371,17 @@ class ComposerProxyHandler implements RequestHandler {
         $baseUrl = $request->getUri()->getScheme() . '://' . $request->getUri()->getAuthority();
         $replacedCount = 0;
 
-        // КРИТИЧНО: Переписываем metadata-url в packages.json
-        // Это заставляет Composer запрашивать все метаданные через прокси
+        // Переписываем metadata-url в packages.json
         if (isset($data['metadata-url']) && is_string($data['metadata-url'])) {
             $original = $data['metadata-url'];
-            // Заменяем домен Packagist на наш прокси
-            $data['metadata-url'] = preg_replace(
-                '#https?://[^/]+#',
-                $baseUrl,
-                $original
-            );
+            $data['metadata-url'] = preg_replace('#https?://[^/]+#', $baseUrl, $original);
             if ($data['metadata-url'] !== $original) {
                 fwrite(STDERR, "[DEBUG] Rewrote metadata-url: {$original} -> {$data['metadata-url']}\n");
                 $replacedCount++;
             }
         }
 
-        // Также переписываем другие URL в packages.json
+        // Переписываем другие URL в packages.json
         $urlFields = ['providers-url', 'metadata-changes-url', 'search', 'list', 'providers-api'];
         foreach ($urlFields as $field) {
             if (isset($data[$field]) && is_string($data[$field])) {
@@ -339,7 +393,7 @@ class ComposerProxyHandler implements RequestHandler {
             }
         }
 
-        // Рекурсивно переписываем URL архивов (api.github.com, codeload.github.com)
+        // Рекурсивно переписываем URL архивов
         $this->rewriteUrlsRecursive($data, $baseUrl, $replacedCount);
 
         if ($replacedCount > 0) {
@@ -391,7 +445,7 @@ $consoleLogger = new class implements LoggerInterface {
 $server = new SocketHttpServer(
     $consoleLogger,
     new \Amp\Socket\ResourceServerSocketFactory(),
-    new Amp\Http\Server\Driver\SocketClientFactory(new NullLogger())
+    new Amp\Http\Server\Driver\SocketClientFactory(new \Psr\Log\NullLogger())
 );
 
 $server->expose($config['listen']);

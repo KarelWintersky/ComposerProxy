@@ -1,0 +1,17 @@
+{
+    "name": "arris/composer-proxy",
+    "authors": [
+        {
+            "name": "karelwintersky",
+            "email": "karel@wintersky.ru"
+        }
+    ],
+    "require": {
+        "amphp/amp": "^3",
+        "amphp/http-server": "^3",
+        "amphp/http-server-router": "^2",
+        "amphp/http-client": "^5",
+        "amphp/file": "^3",
+        "amphp/socket": "^2.4"
+    }
+}

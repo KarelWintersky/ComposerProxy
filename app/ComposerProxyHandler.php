@@ -51,7 +51,15 @@ class ComposerProxyHandler implements RequestHandler
     /**
      * Извлекает vendor/package из URL и формирует путь к файлу
      */
+    /**
+     * Извлекает vendor/package из URL и формирует путь к файлу
+     */
     private function getCachePath(string $url, string $type): string {
+        // Специальный случай: корневой packages.json (описание самого репозитория)
+        if (preg_match('#/packages\.json$#', $url)) {
+            return $this->config['cache_dir'] . '/package.json';
+        }
+
         $vendor = 'unknown';
         $package = 'unknown';
         $hash = null;
@@ -82,10 +90,8 @@ class ComposerProxyHandler implements RequestHandler
 
         // Формируем путь
         if ($type === 'metadata') {
-            // cache/vendor/package/package.json
             return $this->config['cache_dir'] . '/' . $vendor . '/' . $package . '/package.json';
         } else {
-            // cache/vendor/package/hash.zip
             return $this->config['cache_dir'] . '/' . $vendor . '/' . $package . '/' . $hash . '.zip';
         }
     }

@@ -88,19 +88,26 @@ class StatsHandler implements RequestHandler
     /**
      * Парсит URL и определяет тип (metadata или archive), имя пакета и версию
      */
-    private function parsePackageInfo(string $url, string $filePath): array
-    {
+    /**
+     * Парсит URL и определяет тип (metadata или archive), имя пакета и версию
+     */
+    private function parsePackageInfo(string $url, string $filePath): array {
         $package = 'Unknown';
         $version = 'N/A';
         $type = 'archive';
 
-        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~([^/\.]+))?\.json#', $url, $m)) {
+        // Специальный случай: корневой packages.json
+        if (preg_match('#/packages\.json$#', $url)) {
+            $package = 'packagist.org';
+            $version = 'root';
+            $type = 'metadata';
+        } elseif (preg_match('#/p2/([^/]+)/([^/]+?)(?:~([^/\.]+))?\.json#', $url, $m)) {
             $package = $m[1] . '/' . $m[2];
-            $version = 'metadata';
+            $version = $m[3] ?? 'any';
             $type = 'metadata';
         } elseif (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
             $package = $m[1] . '/' . $m[2];
-            $version = substr($m[3], 0, 8); // Короткий хеш
+            $version = substr($m[3], 0, 8);
             $type = 'archive';
         } elseif (preg_match('#api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)#', $url, $m)) {
             $package = $m[1] . '/' . $m[2];

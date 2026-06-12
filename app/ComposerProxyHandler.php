@@ -194,7 +194,7 @@ class ComposerProxyHandler implements RequestHandler
                         if ($vendorPackage && isset($metadata['packages'])) {
                             async(function () use ($metadata, $vendorPackage) {
                                 try {
-                                    $stmt = $this->pdo->prepare("INSERT OR REPLACE INTO archive_mapping (archive_url, vendor_package) VALUES (:url, :pkg)");
+                                    $stmt = $this->pdo->prepare("INSERT OR REPLACE INTO archive_mapping (archive_url, vendor_package, version) VALUES (:url, :pkg, :ver)");
 
                                     foreach ($metadata['packages'] as $packageName => $versions) {
                                         if (!is_array($versions)) continue;
@@ -205,7 +205,8 @@ class ComposerProxyHandler implements RequestHandler
                                             $archiveUrl = $versionData['dist']['url'];
                                             $stmt->execute([
                                                 'url' => $archiveUrl,
-                                                'pkg' => $vendorPackage
+                                                'pkg' => $vendorPackage,
+                                                'ver' => $version // <-- Сохраняем версию!
                                             ]);
                                         }
                                     }
@@ -297,15 +298,17 @@ class ComposerProxyHandler implements RequestHandler
 
             // ПРОВЕРЯЕМ МАППИНГ: получаем composer-имя пакета для этого URL архива
             $mappingFuture = async(function () use ($targetUrl) {
-                $stmt = $this->pdo->prepare("SELECT vendor_package FROM archive_mapping WHERE archive_url = :url");
+                $stmt = $this->pdo->prepare("SELECT vendor_package, version FROM archive_mapping WHERE archive_url = :url");
                 $stmt->execute(['url' => $targetUrl]);
-                return $stmt->fetchColumn();
+                return $stmt->fetch();
             });
-            $vendorPackage = $mappingFuture->await();
+            $mappingData = $mappingFuture->await();
+
+            $vendorPackage = $mappingData['vendor_package'] ?? null;
+            $packageVersion = $mappingData['version'] ?? '';
 
             // Формируем путь с учётом маппинга
             if ($vendorPackage) {
-                // Извлекаем хеш из URL
                 $hash = null;
                 if (preg_match('#/(?:zipball|legacy\.zip)/([^/]+)#', $targetUrl, $m)) {
                     $hash = $m[1];
@@ -314,9 +317,8 @@ class ComposerProxyHandler implements RequestHandler
                 }
 
                 $finalPath = $this->config['cache_dir'] . '/' . $vendorPackage . '/' . $hash . '.zip';
-                fwrite(STDERR, "[DEBUG] Using mapping: {$targetUrl} -> {$vendorPackage}\n");
+                fwrite(STDERR, "[DEBUG] Using mapping: {$targetUrl} -> {$vendorPackage} (version: {$packageVersion})\n");
             } else {
-                // Если маппинга нет, используем стандартный путь
                 $finalPath = $this->getCachePath($targetUrl, 'archive');
                 fwrite(STDERR, "[DEBUG] No mapping found, using default path\n");
             }
@@ -352,11 +354,11 @@ class ComposerProxyHandler implements RequestHandler
                 $ttl = $this->config['archive_ttl'];
                 $now = time();
 
-                async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now) {
-                    $stmt = $this->pdo->prepare("REPLACE INTO cache_entries (url, file_path, content_type, expires_at, created_at, last_accessed_at) VALUES (:url, :path, :ct, :exp, :now, :now)");
+                async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now, $packageVersion) {
+                    $stmt = $this->pdo->prepare("REPLACE INTO cache_entries (url, file_path, content_type, expires_at, created_at, last_accessed_at, package_version) VALUES (:url, :path, :ct, :exp, :now, :now, :ver)");
                     $stmt->execute([
                         'url' => $targetUrl, 'path' => $finalPath, 'ct' => $contentType,
-                        'exp' => $now + $ttl, 'now' => $now
+                        'exp' => $now + $ttl, 'now' => $now, 'ver' => $packageVersion
                     ]);
                 });
 

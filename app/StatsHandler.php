@@ -20,27 +20,28 @@ class StatsHandler implements RequestHandler
         $this->config = $config;
     }
 
-    public function handleRequest(Request $request): Response
-    {
+    public function handleRequest(Request $request): Response {
         parse_str($request->getUri()->getQuery(), $queryParams);
 
         if (($queryParams['token'] ?? '') !== $this->config['stats_token']) {
             return new Response(403, ['content-type' => 'text/plain'], 'Forbidden: Invalid token');
         }
 
-        $stmt = $this->pdo->query("SELECT url, file_path, content_type, expires_at, created_at, last_accessed_at FROM cache_entries ORDER BY last_accessed_at DESC");
+        $stmt = $this->pdo->query("SELECT url, file_path, content_type, expires_at, created_at, last_accessed_at, package_version FROM cache_entries ORDER BY last_accessed_at DESC");
         $entries = $stmt->fetchAll();
 
         $totalSize = 0;
         $packages = [];
 
-        // 1. Группируем данные по имени пакета
         foreach ($entries as $row) {
             $size = file_exists($row['file_path']) ? filesize($row['file_path']) : 0;
             $totalSize += $size;
 
             $info = $this->parsePackageInfo($row['url'], $row['file_path']);
             $pkgName = $info['package'];
+
+            // Используем версию из БД, если она есть
+            $version = !empty($row['package_version']) ? $row['package_version'] : $info['version'];
 
             if (!isset($packages[$pkgName])) {
                 $packages[$pkgName] = [
@@ -56,29 +57,39 @@ class StatsHandler implements RequestHandler
                 $packages[$pkgName]['metadata_created'] = max($packages[$pkgName]['metadata_created'], $row['created_at']);
                 $packages[$pkgName]['metadata_accessed'] = max($packages[$pkgName]['metadata_accessed'], $row['last_accessed_at']);
             } else {
-                // Если версия уже есть, обновляем данные (на случай дубликатов), иначе создаем
-                if (!isset($packages[$pkgName]['versions'][$info['version']])) {
-                    $packages[$pkgName]['versions'][$info['version']] = [
+                if (!isset($packages[$pkgName]['versions'][$version])) {
+                    $packages[$pkgName]['versions'][$version] = [
                         'size' => 0,
                         'created' => 0,
                         'accessed' => 0
                     ];
                 }
-                $packages[$pkgName]['versions'][
-                    $info['version']
-                ]['size'] += $size;
-                $packages[$pkgName]['versions'][$info['version']]['created'] = max($packages[$pkgName]['versions'][$info['version']]['created'], $row['created_at']);
-                $packages[$pkgName]['versions'][$info['version']]['accessed'] = max($packages[$pkgName]['versions'][$info['version']]['accessed'], $row['last_accessed_at']);
+                $packages[$pkgName]['versions'][$version]['size'] += $size;
+                $packages[$pkgName]['versions'][$version]['created'] = max($packages[$pkgName]['versions'][$version]['created'], $row['created_at']);
+                $packages[$pkgName]['versions'][$version]['accessed'] = max($packages[$pkgName]['versions'][$version]['accessed'], $row['last_accessed_at']);
             }
         }
 
-        // 2. Сортируем версии внутри пакета по дате доступа (новые сверху)
+        // Сортируем версии внутри пакета по дате доступа
         foreach ($packages as &$pkg) {
-            uasort($pkg['versions'], function ($a, $b) {
+            uasort($pkg['versions'], function($a, $b) {
                 return $b['accessed'] <=> $a['accessed'];
             });
         }
         unset($pkg);
+
+        // Сортируем пакеты: packagist.org первым, остальные по алфавиту
+        $rootPackage = null;
+        if (isset($packages['packagist.org'])) {
+            $rootPackage = ['packagist.org' => $packages['packagist.org']];
+            unset($packages['packagist.org']);
+        }
+
+        ksort($packages, SORT_STRING);
+
+        if ($rootPackage) {
+            $packages = $rootPackage + $packages;
+        }
 
         $html = $this->generateHtml($packages, $totalSize);
 

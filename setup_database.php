@@ -64,6 +64,14 @@ try {
     if (!in_array('last_accessed_at', $columns, true)) {
         $pdo->exec("ALTER TABLE cache_entries ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT " . time());
     }
+    if (!in_array('package_version', $columns, true)) {
+        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN package_version TEXT DEFAULT ''");
+    }
+
+    $columns = $pdo->query("PRAGMA table_info(archive_mapping)")->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('version', $columns, true)) {
+        $pdo->exec("ALTER TABLE archive_mapping ADD COLUMN version TEXT DEFAULT ''");
+    }
 
     $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='archive_mapping'")->fetch();
     if (!$tables) {
@@ -76,13 +84,6 @@ try {
     }
 
     echo "Database initialized successfully at: {$config['db_path']}\n";
-
-    // Установка правильных прав на файлы (для пользователя www-data или выделенного пользователя)
-    // В DEB-пакете это обычно делается через chown в postinst, но для надежности:
-    if (function_exists('posix_getuid')) {
-        // Предполагаем, что сервис будет запущен от пользователя 'composer-proxy' или 'www-data'
-        // Здесь можно добавить логику chown, если известно имя пользователя
-    }
 
 } catch (PDOException $e) {
     fwrite(STDERR, "Database initialization failed: " . $e->getMessage() . "\n");

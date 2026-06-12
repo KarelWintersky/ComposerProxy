@@ -2,5 +2,4 @@
 composer.lock
 cache
 vendor
-cache.sqlite
-identifier.sqlite
+*.sqlite

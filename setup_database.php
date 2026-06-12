@@ -37,7 +37,7 @@ try {
     $pdo->exec('PRAGMA journal_mode = WAL;');
     $pdo->exec('PRAGMA synchronous = NORMAL;');
 
-    // Создаем таблицу со всеми необходимыми колонками
+    // Основная таблица кэша
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS cache_entries (
             url TEXT PRIMARY KEY,
@@ -49,38 +49,42 @@ try {
         )
     ");
 
+    // Таблица маппинга архивов
     $pdo->exec("
-    CREATE TABLE IF NOT EXISTS archive_mapping (
-        archive_url TEXT PRIMARY KEY,
-        vendor_package TEXT NOT NULL
-    )
+        CREATE TABLE IF NOT EXISTS archive_mapping (
+            archive_url TEXT PRIMARY KEY,
+            vendor_package TEXT NOT NULL,
+            version TEXT DEFAULT '',
+            reference TEXT DEFAULT '',
+            source_url TEXT DEFAULT ''
+        )
     ");
 
-    // Миграция: добавляем колонки, если обновляемся со старой версии
+    // Миграции для cache_entries
     $columns = $pdo->query("PRAGMA table_info(cache_entries)")->fetchAll(PDO::FETCH_COLUMN, 1);
-    if (!in_array('created_at', $columns, true)) {
-        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN created_at INTEGER NOT NULL DEFAULT " . time());
-    }
-    if (!in_array('last_accessed_at', $columns, true)) {
-        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN last_accessed_at INTEGER NOT NULL DEFAULT " . time());
+    if (!in_array('composer_package', $columns, true)) {
+        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN composer_package TEXT DEFAULT ''");
     }
     if (!in_array('package_version', $columns, true)) {
         $pdo->exec("ALTER TABLE cache_entries ADD COLUMN package_version TEXT DEFAULT ''");
     }
-
-    $columns = $pdo->query("PRAGMA table_info(archive_mapping)")->fetchAll(PDO::FETCH_COLUMN, 1);
-    if (!in_array('version', $columns, true)) {
-        $pdo->exec("ALTER TABLE archive_mapping ADD COLUMN version TEXT DEFAULT ''");
+    if (!in_array('reference', $columns, true)) {
+        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN reference TEXT DEFAULT ''");
+    }
+    if (!in_array('source_url', $columns, true)) {
+        $pdo->exec("ALTER TABLE cache_entries ADD COLUMN source_url TEXT DEFAULT ''");
     }
 
-    $tables = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name='archive_mapping'")->fetch();
-    if (!$tables) {
-        $pdo->exec("
-        CREATE TABLE IF NOT EXISTS archive_mapping (
-            archive_url TEXT PRIMARY KEY,
-            vendor_package TEXT NOT NULL
-        )
-    ");
+    // Миграции для archive_mapping
+    $columns2 = $pdo->query("PRAGMA table_info(archive_mapping)")->fetchAll(PDO::FETCH_COLUMN, 1);
+    if (!in_array('version', $columns2, true)) {
+        $pdo->exec("ALTER TABLE archive_mapping ADD COLUMN version TEXT DEFAULT ''");
+    }
+    if (!in_array('reference', $columns2, true)) {
+        $pdo->exec("ALTER TABLE archive_mapping ADD COLUMN reference TEXT DEFAULT ''");
+    }
+    if (!in_array('source_url', $columns2, true)) {
+        $pdo->exec("ALTER TABLE archive_mapping ADD COLUMN source_url TEXT DEFAULT ''");
     }
 
     echo "Database initialized successfully at: {$config['db_path']}\n";

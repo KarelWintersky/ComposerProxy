@@ -20,14 +20,20 @@ class StatsHandler implements RequestHandler
         $this->config = $config;
     }
 
-    public function handleRequest(Request $request): Response {
+    public function handleRequest(Request $request): Response
+    {
         parse_str($request->getUri()->getQuery(), $queryParams);
 
         if (($queryParams['token'] ?? '') !== $this->config['stats_token']) {
             return new Response(403, ['content-type' => 'text/plain'], 'Forbidden: Invalid token');
         }
 
-        $stmt = $this->pdo->query("SELECT url, file_path, content_type, expires_at, created_at, last_accessed_at, package_version FROM cache_entries ORDER BY last_accessed_at DESC");
+        $stmt = $this->pdo->query("
+            SELECT url, file_path, content_type, expires_at, created_at, last_accessed_at,
+                   composer_package, package_version, reference, source_url 
+            FROM cache_entries 
+            ORDER BY last_accessed_at DESC
+        ");
         $entries = $stmt->fetchAll();
 
         $totalSize = 0;
@@ -37,22 +43,32 @@ class StatsHandler implements RequestHandler
             $size = file_exists($row['file_path']) ? filesize($row['file_path']) : 0;
             $totalSize += $size;
 
-            $info = $this->parsePackageInfo($row['url'], $row['file_path']);
-            $pkgName = $info['package'];
+            // Используем composer-имя из БД, fallback на парсинг URL
+            $pkgName = !empty($row['composer_package'])
+                ? $row['composer_package']
+                : $this->parsePackageName($row['url']);
 
-            // Используем версию из БД, если она есть
-            $version = !empty($row['package_version']) ? $row['package_version'] : $info['version'];
+            $version = !empty($row['package_version']) ? $row['package_version'] : 'unknown';
+            $sourceUrl = $row['source_url'] ?? '';
+            $reference = $row['reference'] ?? '';
+            $type = str_contains($row['file_path'], '.zip') ? 'archive' : 'metadata';
 
             if (!isset($packages[$pkgName])) {
                 $packages[$pkgName] = [
                     'metadata_size' => 0,
                     'metadata_created' => 0,
                     'metadata_accessed' => 0,
+                    'source_url' => $sourceUrl,
                     'versions' => []
                 ];
             }
 
-            if ($info['type'] === 'metadata') {
+            // Обновляем source_url, если он появился
+            if (!empty($sourceUrl) && empty($packages[$pkgName]['source_url'])) {
+                $packages[$pkgName]['source_url'] = $sourceUrl;
+            }
+
+            if ($type === 'metadata') {
                 $packages[$pkgName]['metadata_size'] += $size;
                 $packages[$pkgName]['metadata_created'] = max($packages[$pkgName]['metadata_created'], $row['created_at']);
                 $packages[$pkgName]['metadata_accessed'] = max($packages[$pkgName]['metadata_accessed'], $row['last_accessed_at']);
@@ -61,18 +77,23 @@ class StatsHandler implements RequestHandler
                     $packages[$pkgName]['versions'][$version] = [
                         'size' => 0,
                         'created' => 0,
-                        'accessed' => 0
+                        'accessed' => 0,
+                        'reference' => $reference,
                     ];
                 }
                 $packages[$pkgName]['versions'][$version]['size'] += $size;
                 $packages[$pkgName]['versions'][$version]['created'] = max($packages[$pkgName]['versions'][$version]['created'], $row['created_at']);
                 $packages[$pkgName]['versions'][$version]['accessed'] = max($packages[$pkgName]['versions'][$version]['accessed'], $row['last_accessed_at']);
+                // Обновляем reference, если он появился позже
+                if (!empty($reference) && empty($packages[$pkgName]['versions'][$version]['reference'])) {
+                    $packages[$pkgName]['versions'][$version]['reference'] = $reference;
+                }
             }
         }
 
         // Сортируем версии внутри пакета по дате доступа
         foreach ($packages as &$pkg) {
-            uasort($pkg['versions'], function($a, $b) {
+            uasort($pkg['versions'], function ($a, $b) {
                 return $b['accessed'] <=> $a['accessed'];
             });
         }
@@ -97,40 +118,20 @@ class StatsHandler implements RequestHandler
     }
 
     /**
-     * Парсит URL и определяет тип (metadata или archive), имя пакета и версию
+     * Fallback: парсит имя пакета из URL, если composer_package пуст
      */
-    /**
-     * Парсит URL и определяет тип (metadata или archive), имя пакета и версию
-     */
-    private function parsePackageInfo(string $url, string $filePath): array {
-        $package = 'Unknown';
-        $version = 'N/A';
-        $type = 'archive';
-
-        // Специальный случай: корневой packages.json
+    private function parsePackageName(string $url): string
+    {
         if (preg_match('#/packages\.json$#', $url)) {
-            $package = 'packagist.org';
-            $version = 'root';
-            $type = 'metadata';
-        } elseif (preg_match('#/p2/([^/]+)/([^/]+?)(?:~([^/\.]+))?\.json#', $url, $m)) {
-            $package = $m[1] . '/' . $m[2];
-            $version = $m[3] ?? 'any';
-            $type = 'metadata';
-        } elseif (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
-            $package = $m[1] . '/' . $m[2];
-            $version = substr($m[3], 0, 8);
-            $type = 'archive';
-        } elseif (preg_match('#api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)#', $url, $m)) {
-            $package = $m[1] . '/' . $m[2];
-            $version = substr($m[3], 0, 8);
-            $type = 'archive';
-        } elseif (preg_match('#codeload\.github\.com/([^/]+)/([^/]+)/legacy\.zip/([^/]+)#', $url, $m)) {
-            $package = $m[1] . '/' . $m[2];
-            $version = substr($m[3], 0, 8);
-            $type = 'archive';
+            return 'packagist.org';
         }
-
-        return ['package' => $package, 'version' => $version, 'type' => $type];
+        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~[^/]+)?\.json#', $url, $m)) {
+            return $m[1] . '/' . $m[2];
+        }
+        if (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
+            return $m[1] . '/' . $m[2];
+        }
+        return 'unknown/unknown';
     }
 
     private function formatBytes(int $bytes): string
@@ -146,9 +147,6 @@ class StatsHandler implements RequestHandler
         return $timestamp && $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : 'N/A';
     }
 
-    /**
-     * Генерирует иерархический HTML
-     */
     private function generateHtml(array $packages, int $totalSize): string
     {
         $formatBytes = fn($b) => $this->formatBytes($b);
@@ -163,16 +161,18 @@ class StatsHandler implements RequestHandler
             th, td { padding: 10px 15px; text-align: left; border-bottom: 1px solid #eee; }
             th { background: #f1f3f5; color: #495057; font-weight: 600; font-size: 14px; }
             
-            /* Стили для строки пакета */
             .pkg-row { background: #e9ecef; font-weight: 600; }
             .pkg-row td { border-bottom: 1px solid #dee2e6; }
             .pkg-name { color: #228be6; font-family: monospace; font-size: 15px; }
+            .pkg-repo { display: block; font-size: 11px; color: #868e96; font-weight: normal; margin-top: 2px; }
+            .pkg-repo a { color: #868e96; text-decoration: none; }
+            .pkg-repo a:hover { text-decoration: underline; }
             
-            /* Стили для строк версий */
             .ver-row { background: #fff; }
             .ver-row:hover { background: #f1f3f5; }
             .ver-name { padding-left: 30px; color: #495057; font-family: monospace; }
             .ver-name::before { content: '└─ '; color: #adb5bd; }
+            .ver-ref { display: block; font-size: 10px; color: #adb5bd; margin-left: 30px; font-family: monospace; }
             
             .type-meta { color: #e67700; font-size: 13px; }
             .type-arch { color: #2b8a3e; font-size: 13px; }
@@ -194,20 +194,39 @@ class StatsHandler implements RequestHandler
             <tbody>";
 
         foreach ($packages as $pkgName => $data) {
-            // Строка пакета (Метаданные)
+            // Ссылка на репозиторий
+            $repoUrl = $data['source_url'] ?? '';
+            $repoWebUrl = '';
+            if (!empty($repoUrl)) {
+                $repoWebUrl = preg_replace('#^git://#', 'https://', $repoUrl);
+                $repoWebUrl = preg_replace('#\.git$#', '', $repoWebUrl);
+            }
+            $repoLink = $repoWebUrl
+                ? "<span class=\"pkg-repo\"><a href=\"{$repoWebUrl}\" target=\"_blank\">{$repoWebUrl}</a></span>"
+                : '';
+
             $html .= "<tr class=\"pkg-row\">
-                <td><span class=\"pkg-name\">{$pkgName}</span></td>
+                <td>
+                    <span class=\"pkg-name\">{$pkgName}</span>
+                    {$repoLink}
+                </td>
                 <td><span class=\"type-meta\">📄 Metadata</span></td>
                 <td>" . $formatBytes($data['metadata_size']) . "</td>
                 <td>" . $formatDate($data['metadata_created']) . "</td>
                 <td>" . $formatDate($data['metadata_accessed']) . "</td>
             </tr>";
 
-            // Строки версий (Архивы)
             if (!empty($data['versions'])) {
                 foreach ($data['versions'] as $verName => $verData) {
+                    $ref = $verData['reference'] ?? '';
+                    $refShort = !empty($ref) ? substr($ref, 0, 8) : '';
+                    $refLine = !empty($refShort) ? "<span class=\"ver-ref\">ref: {$refShort}</span>" : '';
+
                     $html .= "<tr class=\"ver-row\">
-                        <td><span class=\"ver-name\">{$verName}</span></td>
+                        <td>
+                            <span class=\"ver-name\">{$verName}</span>
+                            {$refLine}
+                        </td>
                         <td><span class=\"type-arch\">📦 Archive</span></td>
                         <td>" . $formatBytes($verData['size']) . "</td>
                         <td>" . $formatDate($verData['created']) . "</td>

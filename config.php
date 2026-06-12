@@ -11,7 +11,7 @@ return [
     'cache_dir' => __DIR__ . '/cache',
 
     // Путь к файлу базы данных SQLite
-    'db_path' => __DIR__ . '/composer_cache.sqlite',
+    'db_path' => __DIR__ . '/cache.sqlite',
 
     // Время жизни кэша по умолчанию (в секундах). 1 час.
     // Для .zip и .tar архивов прокси автоматически установит TTL в 1 год,

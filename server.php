@@ -5,19 +5,12 @@ declare(strict_types=1);
 require __DIR__ . '/vendor/autoload.php';
 
 use Amp\Http\Server\Request;
-use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use Amp\Http\Server\DefaultErrorHandler;
 use Amp\Http\Server\SocketHttpServer;
 use Amp\Http\Client\HttpClientBuilder;
-use Amp\Http\Client\Request as ClientRequest;
-use Amp\File\File;
 use App\ComposerProxyHandler;
 use App\StatsHandler;
-use Psr\Log\LoggerInterface;
-use Psr\Log\NullLogger;
-use function Amp\File\openFile;
-use function Amp\async;
 use function Amp\trapSignal;
 
 class Router implements \Amp\Http\Server\RequestHandler
@@ -42,9 +35,9 @@ class Router implements \Amp\Http\Server\RequestHandler
             return $this->statsHandler->handleRequest($request);
         }
 
-        /*if ($path === '/download') {
+        if ($path === '/download') {
             return $this->proxyHandler->handleDownload($request);
-        }*/
+        }
 
         // Новый маршрут для скачивания архивов через прокси
         if ($path === '/proxy') {

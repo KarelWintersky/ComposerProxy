@@ -33,12 +33,14 @@ class StatsHandler implements RequestHandler {
         ");
         $entries = $stmt->fetchAll();
 
-        $totalSize = 0;
+        $totalArchiveSize = 0;
+        $totalArchivesCount = 0;
+        $totalIndexSize = 0;
+        $totalIndexesCount = 0;
         $packages = [];
 
         foreach ($entries as $row) {
             $size = file_exists($row['file_path']) ? filesize($row['file_path']) : 0;
-            $totalSize += $size;
 
             $pkgName = !empty($row['composer_package'])
                 ? $row['composer_package']
@@ -51,7 +53,6 @@ class StatsHandler implements RequestHandler {
 
             if (!isset($packages[$pkgName])) {
                 $packages[$pkgName] = [
-                    'metadata_size' => 0,
                     'metadata_created' => 0,
                     'metadata_accessed' => 0,
                     'source_url' => $sourceUrl,
@@ -64,17 +65,24 @@ class StatsHandler implements RequestHandler {
             }
 
             if ($type === 'metadata') {
-                $packages[$pkgName]['metadata_size'] += $size;
+                // Считаем размеры индексов
+                $totalIndexSize += $size;
+                $totalIndexesCount++;
+
                 $packages[$pkgName]['metadata_created'] = max($packages[$pkgName]['metadata_created'], $row['created_at']);
                 $packages[$pkgName]['metadata_accessed'] = max($packages[$pkgName]['metadata_accessed'], $row['last_accessed_at']);
             } else {
+                // Считаем размеры архивов
+                $totalArchiveSize += $size;
+                $totalArchivesCount++;
+
                 if (!isset($packages[$pkgName]['versions'][$version])) {
                     $packages[$pkgName]['versions'][$version] = [
                         'size' => 0,
                         'created' => 0,
                         'accessed' => 0,
                         'reference' => $reference,
-                        'archive_url' => $row['url'], // <-- сохраняем URL архива для ссылки на скачивание
+                        'archive_url' => $row['url'],
                     ];
                 }
                 $packages[$pkgName]['versions'][$version]['size'] += $size;
@@ -107,7 +115,7 @@ class StatsHandler implements RequestHandler {
             $packages = $rootPackage + $packages;
         }
 
-        $html = $this->generateHtml($packages, $totalSize);
+        $html = $this->generateHtml($packages, $totalArchiveSize, $totalArchivesCount, $totalIndexSize, $totalIndexesCount);
 
         return new Response(200, ['content-type' => 'text/html; charset=utf-8'], $html);
     }
@@ -136,7 +144,7 @@ class StatsHandler implements RequestHandler {
         return $timestamp && $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : 'N/A';
     }
 
-    private function generateHtml(array $packages, int $totalSize): string {
+    private function generateHtml(array $packages, int $totalArchiveSize, int $totalArchivesCount, int $totalIndexSize, int $totalIndexesCount): string {
         $formatBytes = fn($b) => $this->formatBytes($b);
         $formatDate = fn($d) => $this->formatDate($d);
 
@@ -145,6 +153,9 @@ class StatsHandler implements RequestHandler {
             body { font-family: system-ui, -apple-system, sans-serif; padding: 20px; background: #f8f9fa; color: #333; }
             h2 { margin-bottom: 5px; }
             .summary { margin-bottom: 20px; color: #666; }
+            .summary .stat { display: inline-block; margin-right: 20px; }
+            .summary .stat-label { color: #868e96; font-size: 13px; }
+            .summary .stat-value { color: #212529; font-weight: 600; font-size: 15px; }
             table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.1); border-radius: 4px; overflow: hidden; }
             th, td { padding: 10px 15px; text-align: left; border-bottom: 1px solid #eee; }
             th { background: #f1f3f5; color: #495057; font-weight: 600; font-size: 14px; }
@@ -186,7 +197,24 @@ class StatsHandler implements RequestHandler {
         </style>
         </head><body>
         <h2>📦 Composer Proxy Cache</h2>
-        <div class=\"summary\">Total Packages: <b>" . count($packages) . "</b> | Total Size: <b>" . $formatBytes($totalSize) . "</b></div>
+        <div class=\"summary\">
+            <div class=\"stat\">
+                <span class=\"stat-label\">Packages:</span>
+                <span class=\"stat-value\">" . count($packages) . "</span>
+            </div>
+            <div class=\"stat\">
+                <span class=\"stat-label\">Archives:</span>
+                <span class=\"stat-value\">{$totalArchivesCount} (" . $formatBytes($totalArchiveSize) . ")</span>
+            </div>
+            <div class=\"stat\">
+                <span class=\"stat-label\">Indexes:</span>
+                <span class=\"stat-value\">{$totalIndexesCount} (" . $formatBytes($totalIndexSize) . ")</span>
+            </div>
+            <div class=\"stat\">
+                <span class=\"stat-label\">Total:</span>
+                <span class=\"stat-value\">" . $formatBytes($totalArchiveSize + $totalIndexSize) . "</span>
+            </div>
+        </div>
         
         <table>
             <thead>
@@ -212,13 +240,14 @@ class StatsHandler implements RequestHandler {
                 ? "<span class=\"pkg-repo\"><a href=\"{$repoWebUrl}\" target=\"_blank\">{$repoWebUrl}</a></span>"
                 : '';
 
+            // Строка пакета: БЕЗ размера
             $html .= "<tr class=\"pkg-row\">
                 <td>
                     <span class=\"pkg-name\">{$pkgName}</span>
                     {$repoLink}
                 </td>
                 <td></td>
-                <td class=\"size-cell\">" . $formatBytes($data['metadata_size']) . "</td>
+                <td></td>
                 <td class=\"date-cell\">" . $formatDate($data['metadata_created']) . "</td>
                 <td class=\"date-cell\">" . $formatDate($data['metadata_accessed']) . "</td>
             </tr>";
@@ -229,10 +258,9 @@ class StatsHandler implements RequestHandler {
                     $refShort = !empty($ref) ? substr($ref, 0, 8) : '';
                     $archiveUrl = $verData['archive_url'] ?? '';
 
-                    // Формируем ячейку с ref
+                    // Ссылка на ref — напрямую на GitHub
                     if (!empty($refShort) && !empty($archiveUrl)) {
-                        $downloadUrl = '/download?url=' . urlencode($archiveUrl);
-                        $refCell = "<a href=\"{$downloadUrl}\" class=\"ref-link\" title=\"Download archive ({$ref})\">{$refShort}</a>";
+                        $refCell = "<a href=\"{$archiveUrl}\" class=\"ref-link\" target=\"_blank\" title=\"{$archiveUrl}\">{$refShort}</a>";
                     } elseif (!empty($refShort)) {
                         $refCell = "<span class=\"ref-empty\">{$refShort}</span>";
                     } else {

@@ -17,35 +17,64 @@ use function Amp\File\openFile;
 use function Amp\async;
 use function Amp\trapSignal;
 
-class ComposerProxyHandler implements RequestHandler
+class ComposerProxyHandler
 {
     private PDO $pdo;
     private object $httpClient;
     private array $config;
-    private StatsHandler $statsHandler;
 
-    public function __construct(PDO $pdo, object $httpClient, array $config, StatsHandler $statsHandler)
+    public function __construct(PDO $pdo, object $httpClient, array $config)
     {
         $this->pdo = $pdo;
         $this->httpClient = $httpClient;
         $this->config = $config;
-        $this->statsHandler = $statsHandler;
     }
 
-    public function handleRequest(Request $request): Response
+    /**
+     * Отдаёт файл из кэша по его оригинальному URL.
+     * Используется для скачивания архивов прямо из страницы статистики.
+     */
+    public function handleDownload(Request $request): Response
     {
-        $path = $request->getUri()->getPath();
+        parse_str($request->getUri()->getQuery(), $queryParams);
+        $url = $queryParams['url'] ?? '';
 
-        if ($path === '/stats') {
-            return $this->statsHandler->handleRequest($request);
+        if (empty($url)) {
+            return new Response(400, ['content-type' => 'text/plain'], 'Missing url parameter');
         }
 
-        // Новый маршрут для скачивания архивов через прокси
-        if ($path === '/proxy') {
-            return $this->handleProxyDownload($request);
-        }
+        try {
+            $stmt = $this->pdo->prepare("SELECT file_path, content_type FROM cache_entries WHERE url = :url");
+            $stmt->execute(['url' => $url]);
+            $row = $stmt->fetch();
 
-        return $this->handleProxy($request);
+            if (!$row || !file_exists($row['file_path'])) {
+                return new Response(404, ['content-type' => 'text/plain'], 'File not found in cache');
+            }
+
+            // Безопасность: проверяем, что файл находится внутри cache_dir
+            $realPath = realpath($row['file_path']);
+            $cacheDir = realpath($this->config['cache_dir']);
+            if ($realPath === false || $cacheDir === false || !str_starts_with($realPath, $cacheDir)) {
+                return new Response(403, ['content-type' => 'text/plain'], 'Access denied');
+            }
+
+            // Обновляем время доступа
+            async(function () use ($url) {
+                $stmt = $this->pdo->prepare("UPDATE cache_entries SET last_accessed_at = :time WHERE url = :url");
+                $stmt->execute(['time' => time(), 'url' => $url]);
+            });
+
+            $file = openFile($row['file_path'], 'r');
+            return new Response(200, [
+                'content-type' => $row['content_type'] ?: 'application/octet-stream',
+                'content-disposition' => 'attachment; filename="' . basename($row['file_path']) . '"',
+                'x-cache-status' => 'HIT',
+            ], $file);
+        } catch (\Throwable $e) {
+            fwrite(STDERR, "[FATAL ERROR in handleDownload] " . $e->getMessage() . "\n");
+            return new Response(500, ['content-type' => 'text/plain'], "Download Error: " . $e->getMessage());
+        }
     }
 
     /**
@@ -55,8 +84,8 @@ class ComposerProxyHandler implements RequestHandler
      * Извлекает vendor/package из URL и формирует путь к файлу
      */
     private function getCachePath(string $url, string $type): string {
-        // Специальный случай: корневой packages.json (описание самого репозитория)
-        if (preg_match('#/packages\.json$#', $url)) {
+        // Корневой packages.json
+        if (preg_match('~/packages\.json$~', $url)) {
             return $this->config['cache_dir'] . '/package.json';
         }
 
@@ -64,31 +93,23 @@ class ComposerProxyHandler implements RequestHandler
         $package = 'unknown';
         $hash = null;
 
-        // Для метаданных: https://repo.packagist.org/p2/vendor/package.json
-        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~[^/]+)?\.json#', $url, $m)) {
+        if (preg_match('~/p2/([^/]+)/([^/]+?)(?:\~[^/]+)?\.json~', $url, $m)) {
             $vendor = $m[1];
             $package = $m[2];
-        }
-        // Для архивов Packagist: https://repo.packagist.org/d/vendor/package/hash.zip
-        elseif (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
+        } elseif (preg_match('~/d/([^/]+)/([^/]+)/([^/]+)\.zip~', $url, $m)) {
             $vendor = $m[1];
             $package = $m[2];
             $hash = $m[3];
-        }
-        // Для архивов GitHub: https://api.github.com/repos/vendor/package/zipball/hash
-        elseif (preg_match('#api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)#', $url, $m)) {
+        } elseif (preg_match('~api\.github\.com/repos/([^/]+)/([^/]+)/zipball/([^/]+)~', $url, $m)) {
             $vendor = $m[1];
             $package = $m[2];
             $hash = $m[3];
-        }
-        // Для архивов GitHub (codeload): https://codeload.github.com/vendor/package/legacy.zip/hash
-        elseif (preg_match('#codeload\.github\.com/([^/]+)/([^/]+)/legacy\.zip/([^/]+)#', $url, $m)) {
+        } elseif (preg_match('~codeload\.github\.com/([^/]+)/([^/]+)/legacy\.zip/([^/]+)~', $url, $m)) {
             $vendor = $m[1];
             $package = $m[2];
             $hash = $m[3];
         }
 
-        // Формируем путь
         if ($type === 'metadata') {
             return $this->config['cache_dir'] . '/' . $vendor . '/' . $package . '/package.json';
         } else {
@@ -96,7 +117,7 @@ class ComposerProxyHandler implements RequestHandler
         }
     }
 
-    private function handleProxy(Request $request): Response
+    public function handleProxy(Request $request): Response
     {
         $uri = $request->getUri();
         $path = $uri->getPath();
@@ -172,12 +193,12 @@ class ComposerProxyHandler implements RequestHandler
 
                 if ($type === 'metadata') {
                     // Корневой packages.json
-                    if (preg_match('#/packages\.json$#', $targetUrl)) {
+                    if (preg_match('~/packages\.json$~', $targetUrl)) {
                         $composerPackage = 'packagist.org';
                         $packageVersion = 'root';
                     }
                     // Метаданные пакета: /p2/vendor/package.json или /p2/vendor/package~version.json
-                    elseif (preg_match('#/p2/([^/]+)/([^/]+?)(?:~([^/\.]+))?\.json#', $targetUrl, $m)) {
+                    elseif (preg_match('~/p2/([^/]+)/([^/]+?)(?:\~([^/\.]+))?\.json~', $targetUrl, $m)) {
                         $composerPackage = $m[1] . '/' . $m[2];
                         $packageVersion = $m[3] ?? 'any';
                     }
@@ -187,7 +208,6 @@ class ComposerProxyHandler implements RequestHandler
                     $metadata = json_decode($jsonContent, true);
 
                     if ($metadata && isset($metadata['packages'])) {
-                        // Если имя пакета не извлечено из URL, берём из JSON
                         if (empty($composerPackage)) {
                             $firstPackage = reset($metadata['packages']);
                             if (is_array($firstPackage) && !empty($firstPackage)) {
@@ -196,8 +216,7 @@ class ComposerProxyHandler implements RequestHandler
                             }
                         }
 
-                        // СОХРАНЯЕМ МАППИНГ СИНХРОННО — это критично!
-                        // Иначе Composer может запросить архив раньше, чем мы сохраним маппинг
+                        // СОХРАНЯЕМ МАППИНГ СИНХРОННО
                         if (!empty($composerPackage)) {
                             try {
                                 $stmt = $this->pdo->prepare("
@@ -216,7 +235,6 @@ class ComposerProxyHandler implements RequestHandler
                                         $archiveUrl = $versionData['dist']['url'] ?? '';
                                         $ref = $versionData['source']['reference'] ?? '';
                                         $src = $versionData['source']['url'] ?? '';
-                                        // Берём версию из поля version, а не из ключа массива
                                         $ver = $versionData['version'] ?? $version;
 
                                         if (empty($archiveUrl)) continue;
@@ -286,7 +304,7 @@ class ComposerProxyHandler implements RequestHandler
         }
     }
 
-    private function handleProxyDownload(Request $request): Response {
+    public function handleProxyDownload(Request $request): Response {
         parse_str($request->getUri()->getQuery(), $queryParams);
         $targetUrl = $queryParams['url'] ?? '';
 
@@ -334,7 +352,6 @@ class ComposerProxyHandler implements RequestHandler
             });
             $mappingData = $mappingFuture->await();
 
-            // Логируем результат поиска маппинга
             if ($mappingData) {
                 $shortRef = !empty($mappingData['reference']) ? substr($mappingData['reference'], 0, 8) : '(none)';
                 fwrite(STDERR, "[DEBUG] Mapping found: pkg={$mappingData['vendor_package']}, ver={$mappingData['version']}, ref={$shortRef}\n");
@@ -350,7 +367,7 @@ class ComposerProxyHandler implements RequestHandler
             $reference = $mappingData['reference'] ?? '';
             $sourceUrl = $mappingData['source_url'] ?? '';
 
-            // Извлекаем хеш из URL архива (на случай, если reference пуст)
+            // Извлекаем хеш из URL архива
             $hash = '';
             if (preg_match('~/(?:zipball|legacy\.zip)/([^/?#]+)~', $targetUrl, $m)) {
                 $hash = $m[1];
@@ -400,7 +417,6 @@ class ComposerProxyHandler implements RequestHandler
                 $ttl = $this->config['archive_ttl'];
                 $now = time();
 
-                // Сохраняем ВСЕ данные в cache_entries
                 async(function () use ($targetUrl, $finalPath, $contentType, $ttl, $now, $composerPackage, $packageVersion, $reference, $sourceUrl) {
                     $stmt = $this->pdo->prepare("
                         REPLACE INTO cache_entries 

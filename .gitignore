@@ -3,3 +3,7 @@ composer.lock
 cache
 vendor
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+

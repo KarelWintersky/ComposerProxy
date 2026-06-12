@@ -9,19 +9,16 @@ use Amp\Http\Server\RequestHandler;
 use Amp\Http\Server\Response;
 use PDO;
 
-class StatsHandler implements RequestHandler
-{
+class StatsHandler implements RequestHandler {
     private PDO $pdo;
     private array $config;
 
-    public function __construct(PDO $pdo, array $config)
-    {
+    public function __construct(PDO $pdo, array $config) {
         $this->pdo = $pdo;
         $this->config = $config;
     }
 
-    public function handleRequest(Request $request): Response
-    {
+    public function handleRequest(Request $request): Response {
         parse_str($request->getUri()->getQuery(), $queryParams);
 
         if (($queryParams['token'] ?? '') !== $this->config['stats_token']) {
@@ -43,7 +40,6 @@ class StatsHandler implements RequestHandler
             $size = file_exists($row['file_path']) ? filesize($row['file_path']) : 0;
             $totalSize += $size;
 
-            // Используем composer-имя из БД, fallback на парсинг URL
             $pkgName = !empty($row['composer_package'])
                 ? $row['composer_package']
                 : $this->parsePackageName($row['url']);
@@ -63,7 +59,6 @@ class StatsHandler implements RequestHandler
                 ];
             }
 
-            // Обновляем source_url, если он появился
             if (!empty($sourceUrl) && empty($packages[$pkgName]['source_url'])) {
                 $packages[$pkgName]['source_url'] = $sourceUrl;
             }
@@ -79,12 +74,12 @@ class StatsHandler implements RequestHandler
                         'created' => 0,
                         'accessed' => 0,
                         'reference' => $reference,
+                        'archive_url' => $row['url'], // <-- сохраняем URL архива для ссылки на скачивание
                     ];
                 }
                 $packages[$pkgName]['versions'][$version]['size'] += $size;
                 $packages[$pkgName]['versions'][$version]['created'] = max($packages[$pkgName]['versions'][$version]['created'], $row['created_at']);
                 $packages[$pkgName]['versions'][$version]['accessed'] = max($packages[$pkgName]['versions'][$version]['accessed'], $row['last_accessed_at']);
-                // Обновляем reference, если он появился позже
                 if (!empty($reference) && empty($packages[$pkgName]['versions'][$version]['reference'])) {
                     $packages[$pkgName]['versions'][$version]['reference'] = $reference;
                 }
@@ -93,7 +88,7 @@ class StatsHandler implements RequestHandler
 
         // Сортируем версии внутри пакета по дате доступа
         foreach ($packages as &$pkg) {
-            uasort($pkg['versions'], function ($a, $b) {
+            uasort($pkg['versions'], function($a, $b) {
                 return $b['accessed'] <=> $a['accessed'];
             });
         }
@@ -117,38 +112,31 @@ class StatsHandler implements RequestHandler
         return new Response(200, ['content-type' => 'text/html; charset=utf-8'], $html);
     }
 
-    /**
-     * Fallback: парсит имя пакета из URL, если composer_package пуст
-     */
-    private function parsePackageName(string $url): string
-    {
-        if (preg_match('#/packages\.json$#', $url)) {
+    private function parsePackageName(string $url): string {
+        if (preg_match('~/packages\.json$~', $url)) {
             return 'packagist.org';
         }
-        if (preg_match('#/p2/([^/]+)/([^/]+?)(?:~[^/]+)?\.json#', $url, $m)) {
+        if (preg_match('~/p2/([^/]+)/([^/]+?)(?:\~[^/]+)?\.json~', $url, $m)) {
             return $m[1] . '/' . $m[2];
         }
-        if (preg_match('#/d/([^/]+)/([^/]+)/([^/]+)\.zip#', $url, $m)) {
+        if (preg_match('~/d/([^/]+)/([^/]+)/([^/]+)\.zip~', $url, $m)) {
             return $m[1] . '/' . $m[2];
         }
         return 'unknown/unknown';
     }
 
-    private function formatBytes(int $bytes): string
-    {
+    private function formatBytes(int $bytes): string {
         if ($bytes === 0) return '0 B';
         $pow = floor(log($bytes) / log(1024));
         $pow = min($pow, 3);
         return round($bytes / (1024 ** $pow), 2) . ' ' . ['B', 'KB', 'MB', 'GB'][$pow];
     }
 
-    private function formatDate(?int $timestamp): string
-    {
+    private function formatDate(?int $timestamp): string {
         return $timestamp && $timestamp > 0 ? date('Y-m-d H:i', $timestamp) : 'N/A';
     }
 
-    private function generateHtml(array $packages, int $totalSize): string
-    {
+    private function generateHtml(array $packages, int $totalSize): string {
         $formatBytes = fn($b) => $this->formatBytes($b);
         $formatDate = fn($d) => $this->formatDate($d);
 
@@ -172,10 +160,29 @@ class StatsHandler implements RequestHandler
             .ver-row:hover { background: #f1f3f5; }
             .ver-name { padding-left: 30px; color: #495057; font-family: monospace; }
             .ver-name::before { content: '└─ '; color: #adb5bd; }
-            .ver-ref { display: block; font-size: 10px; color: #adb5bd; margin-left: 30px; font-family: monospace; }
             
-            .type-meta { color: #e67700; font-size: 13px; }
-            .type-arch { color: #2b8a3e; font-size: 13px; }
+            .ref-link { 
+                font-family: monospace; 
+                font-size: 12px; 
+                color: #228be6; 
+                text-decoration: none;
+                background: #e7f5ff;
+                padding: 2px 6px;
+                border-radius: 3px;
+                border: 1px solid #a5d8ff;
+            }
+            .ref-link:hover { 
+                background: #d0ebff; 
+                text-decoration: underline;
+            }
+            .ref-empty {
+                font-family: monospace;
+                font-size: 12px;
+                color: #adb5bd;
+            }
+            
+            .size-cell { font-family: monospace; font-size: 13px; color: #495057; }
+            .date-cell { font-size: 13px; color: #868e96; }
         </style>
         </head><body>
         <h2>📦 Composer Proxy Cache</h2>
@@ -184,11 +191,11 @@ class StatsHandler implements RequestHandler
         <table>
             <thead>
                 <tr>
-                    <th style=\"width: 35%\">Package / Version</th>
-                    <th style=\"width: 15%\">Type</th>
-                    <th style=\"width: 15%\">Size</th>
-                    <th style=\"width: 15%\">Created</th>
-                    <th style=\"width: 20%\">Last Accessed</th>
+                    <th style=\"width: 30%\">Package / Version</th>
+                    <th style=\"width: 12%\">Ref</th>
+                    <th style=\"width: 13%\">Size</th>
+                    <th style=\"width: 18%\">Created</th>
+                    <th style=\"width: 18%\">Last Accessed</th>
                 </tr>
             </thead>
             <tbody>";
@@ -198,8 +205,8 @@ class StatsHandler implements RequestHandler
             $repoUrl = $data['source_url'] ?? '';
             $repoWebUrl = '';
             if (!empty($repoUrl)) {
-                $repoWebUrl = preg_replace('#^git://#', 'https://', $repoUrl);
-                $repoWebUrl = preg_replace('#\.git$#', '', $repoWebUrl);
+                $repoWebUrl = preg_replace('~^git://~', 'https://', $repoUrl);
+                $repoWebUrl = preg_replace('~\.git$~', '', $repoWebUrl);
             }
             $repoLink = $repoWebUrl
                 ? "<span class=\"pkg-repo\"><a href=\"{$repoWebUrl}\" target=\"_blank\">{$repoWebUrl}</a></span>"
@@ -210,27 +217,34 @@ class StatsHandler implements RequestHandler
                     <span class=\"pkg-name\">{$pkgName}</span>
                     {$repoLink}
                 </td>
-                <td><span class=\"type-meta\">📄 Metadata</span></td>
-                <td>" . $formatBytes($data['metadata_size']) . "</td>
-                <td>" . $formatDate($data['metadata_created']) . "</td>
-                <td>" . $formatDate($data['metadata_accessed']) . "</td>
+                <td></td>
+                <td class=\"size-cell\">" . $formatBytes($data['metadata_size']) . "</td>
+                <td class=\"date-cell\">" . $formatDate($data['metadata_created']) . "</td>
+                <td class=\"date-cell\">" . $formatDate($data['metadata_accessed']) . "</td>
             </tr>";
 
             if (!empty($data['versions'])) {
                 foreach ($data['versions'] as $verName => $verData) {
                     $ref = $verData['reference'] ?? '';
                     $refShort = !empty($ref) ? substr($ref, 0, 8) : '';
-                    $refLine = !empty($refShort) ? "<span class=\"ver-ref\">ref: {$refShort}</span>" : '';
+                    $archiveUrl = $verData['archive_url'] ?? '';
+
+                    // Формируем ячейку с ref
+                    if (!empty($refShort) && !empty($archiveUrl)) {
+                        $downloadUrl = '/download?url=' . urlencode($archiveUrl);
+                        $refCell = "<a href=\"{$downloadUrl}\" class=\"ref-link\" title=\"Download archive ({$ref})\">{$refShort}</a>";
+                    } elseif (!empty($refShort)) {
+                        $refCell = "<span class=\"ref-empty\">{$refShort}</span>";
+                    } else {
+                        $refCell = '<span class="ref-empty">—</span>';
+                    }
 
                     $html .= "<tr class=\"ver-row\">
-                        <td>
-                            <span class=\"ver-name\">{$verName}</span>
-                            {$refLine}
-                        </td>
-                        <td><span class=\"type-arch\">📦 Archive</span></td>
-                        <td>" . $formatBytes($verData['size']) . "</td>
-                        <td>" . $formatDate($verData['created']) . "</td>
-                        <td>" . $formatDate($verData['accessed']) . "</td>
+                        <td><span class=\"ver-name\">{$verName}</span></td>
+                        <td>{$refCell}</td>
+                        <td class=\"size-cell\">" . $formatBytes($verData['size']) . "</td>
+                        <td class=\"date-cell\">" . $formatDate($verData['created']) . "</td>
+                        <td class=\"date-cell\">" . $formatDate($verData['accessed']) . "</td>
                     </tr>";
                 }
             } else {

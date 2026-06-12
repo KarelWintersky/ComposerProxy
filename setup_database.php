@@ -2,21 +2,29 @@
 <?php
 declare(strict_types=1);
 
-$configPath = $argv[1] ?? '/etc/composer-proxy/config.php';
+// Приоритет: аргумент CLI > переменная окружения > конфиг рядом со скриптом
+$configPath = $argv[1]
+    ?? getenv('COMPOSER_PROXY_CONFIG')
+    ?: (__DIR__ . '/config.php');
+
 if (!file_exists($configPath)) {
-    fwrite(STDERR, "Config file not found: {$configPath}\n");
+    fwrite(STDERR, "❌ Config not found at: {$configPath}\n");
+    fwrite(STDERR, "Usage: php setup_database.php [/path/to/config.php]\n");
+    fwrite(STDERR, "   Or set COMPOSER_PROXY_CONFIG env variable\n");
     exit(1);
 }
 
 $config = require $configPath;
 
 echo "Initializing Composer Proxy...\n";
+echo "Config: {$configPath}\n";
+echo "Database: {$config['db_path']}\n";
+echo "Cache dir: {$config['cache_dir']}\n\n";
 
 // 1. Создание директорий
 $dirs = [
     dirname($config['db_path']),
     $config['cache_dir'],
-    // '/var/log/composer-proxy'
 ];
 
 foreach ($dirs as $dir) {

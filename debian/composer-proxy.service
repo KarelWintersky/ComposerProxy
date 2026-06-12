@@ -1,0 +1,37 @@
+[Unit]
+Description=Composer Packagist Caching Proxy
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+
+# Путь к конфигу через переменную окружения
+Environment=COMPOSER_PROXY_CONFIG=/etc/composer-proxy/config.php
+
+ExecStart=/usr/bin/php /usr/bin/composer-proxy-server
+WorkingDirectory=/var/lib/composer-proxy
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Ограничение ресурсов
+MemoryMax=512M
+TasksMax=100
+
+# Безопасность
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/composer-proxy /var/log/composer-proxy
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Логирование
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=composer-proxy
+
+[Install]
+WantedBy=multi-user.target

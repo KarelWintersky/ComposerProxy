@@ -76,7 +76,7 @@ class ComposerProxyHandler
                 'x-cache-status' => 'HIT',
             ], $file);
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[FATAL ERROR in handleDownload] " . $e->getMessage() . "\n");
+            $this->logger->error("[FATAL ERROR in handleDownload] " . $e->getMessage());
             return new Response(500, ['content-type' => 'text/plain'], "Download Error: " . $e->getMessage());
         }
     }
@@ -154,7 +154,7 @@ class ComposerProxyHandler
                 ], $content);
             }
 
-            fwrite(STDERR, "[DEBUG] MISS: {$targetUrl}\n");
+            $this->logger->debug("[DEBUG] MISS: {$targetUrl}");
 
             // 2. Скачивание с upstream
             $clientRequest = new ClientRequest($targetUrl);
@@ -185,7 +185,8 @@ class ComposerProxyHandler
                 $file->close();
 
                 rename($tempPath, $finalPath);
-                fwrite(STDERR, "[DEBUG] Cached {$bytesWritten} bytes to {$finalPath}\n");
+
+                $this->logger->debug("[DEBUG] Cached {$bytesWritten} bytes to {$finalPath}");
 
                 // 3. Определяем composer-имя и версию для метаданных
                 $composerPackage = '';
@@ -251,9 +252,9 @@ class ComposerProxyHandler
                                         $mappingCount++;
                                     }
                                 }
-                                fwrite(STDERR, "[DEBUG] Saved {$mappingCount} archive mappings for {$composerPackage}\n");
+                                $this->logger->debug("Saved {$mappingCount} archive mappings for {$composerPackage}");
                             } catch (\Throwable $e) {
-                                fwrite(STDERR, "[DEBUG] Failed to save archive mapping: " . $e->getMessage() . "\n");
+                                $this->logger->error("Failed to save archive mapping: " . $e->getMessage() . "\n");
                             }
                         }
                     }
@@ -301,12 +302,13 @@ class ComposerProxyHandler
                 return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
             }
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[FATAL ERROR in handleProxy] " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+            $this->logger->emergency("[FATAL ERROR in handleProxy] " . $e->getMessage() . "\n" . $e->getTraceAsString());
             return new Response(500, ['content-type' => 'text/plain'], "Proxy Error: " . $e->getMessage());
         }
     }
 
-    public function handleProxyDownload(Request $request): Response {
+    public function handleProxyDownload(Request $request): Response
+    {
         parse_str($request->getUri()->getQuery(), $queryParams);
         $targetUrl = $queryParams['url'] ?? '';
 
@@ -314,7 +316,7 @@ class ComposerProxyHandler
             return new Response(400, ['content-type' => 'text/plain'], 'Missing url parameter');
         }
 
-        fwrite(STDERR, "[DEBUG] Proxy download request: {$targetUrl}\n");
+        $this->logger->debug("[DEBUG] Proxy download request: {$targetUrl}");
 
         try {
             // Проверяем кэш
@@ -333,7 +335,8 @@ class ComposerProxyHandler
                     $stmt->execute(['time' => time(), 'url' => $targetUrl]);
                 });
 
-                fwrite(STDERR, "[DEBUG] Archive HIT: {$targetUrl}\n");
+                // $this->logger->debug("[DEBUG] Archive HIT: {$targetUrl}");
+                $this->logger->debug("[DEBUG] Archive HIT: {$cacheRow['file_path']}.zip");
                 $file = openFile($cacheRow['file_path'], 'r');
                 return new Response(200, [
                     'content-type' => $cacheRow['content_type'] ?: 'application/octet-stream',
@@ -341,7 +344,7 @@ class ComposerProxyHandler
                 ], $file);
             }
 
-            fwrite(STDERR, "[DEBUG] Archive MISS: {$targetUrl}\n");
+            $this->logger->debug("[DEBUG] Archive MISS: {$targetUrl}");
 
             // Получаем ВСЕ данные из маппинга
             $mappingFuture = async(function () use ($targetUrl) {
@@ -356,12 +359,12 @@ class ComposerProxyHandler
 
             if ($mappingData) {
                 $shortRef = !empty($mappingData['reference']) ? substr($mappingData['reference'], 0, 8) : '(none)';
-                fwrite(STDERR, "[DEBUG] Mapping found: pkg={$mappingData['vendor_package']}, ver={$mappingData['version']}, ref={$shortRef}\n");
+                $this->logger->debug("[DEBUG] Mapping found: pkg={$mappingData['vendor_package']}, ver={$mappingData['version']}, ref={$shortRef}");
             } else {
-                fwrite(STDERR, "[DEBUG] WARNING: No mapping found for {$targetUrl}\n");
+                $this->logger->debug("[DEBUG] WARNING: No mapping found for {$targetUrl}");
                 $countStmt = $this->pdo->query("SELECT COUNT(*) FROM archive_mapping");
                 $count = $countStmt->fetchColumn();
-                fwrite(STDERR, "[DEBUG] Total mappings in DB: {$count}\n");
+                $this->logger->debug("[DEBUG] Total mappings in DB: {$count}");
             }
 
             $composerPackage = $mappingData['vendor_package'] ?? '';
@@ -382,10 +385,10 @@ class ComposerProxyHandler
             if (!empty($composerPackage)) {
                 $filename = !empty($reference) ? $reference : ($hash ?: md5($targetUrl));
                 $finalPath = $this->config['cache_dir'] . '/' . $composerPackage . '/' . $filename . '.zip';
-                fwrite(STDERR, "[DEBUG] Using mapping: {$targetUrl} -> {$composerPackage} v{$packageVersion}\n");
+                $this->logger->debug("[DEBUG] Using mapping: {$targetUrl} -> {$composerPackage} v{$packageVersion}");
             } else {
                 $finalPath = $this->getCachePath($targetUrl, 'archive');
-                fwrite(STDERR, "[DEBUG] No mapping found, using default path\n");
+                $this->logger->debug("[DEBUG] No mapping found, using default path");
             }
 
             $tempPath = $finalPath . '.tmp';
@@ -414,7 +417,7 @@ class ComposerProxyHandler
                 $file->close();
 
                 rename($tempPath, $finalPath);
-                fwrite(STDERR, "[DEBUG] Downloaded {$bytesWritten} bytes to {$finalPath}\n");
+                $this->logger->debug("[DEBUG] Downloaded {$bytesWritten} bytes to {$finalPath}");
 
                 $ttl = $this->config['archive_ttl'];
                 $now = time();
@@ -449,7 +452,7 @@ class ComposerProxyHandler
                 return new Response($status, ['content-type' => 'text/plain', 'x-cache-status' => 'ERROR'], "Upstream returned {$status}");
             }
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[FATAL ERROR in handleProxyDownload] " . $e->getMessage() . "\n" . $e->getTraceAsString() . "\n");
+            $this->logger->emergency("[FATAL ERROR in handleProxyDownload] " . $e->getMessage() . "\n" . $e->getTraceAsString());
             return new Response(500, ['content-type' => 'text/plain'], "Proxy Download Error: " . $e->getMessage());
         }
     }
@@ -461,10 +464,11 @@ class ComposerProxyHandler
     /**
      * Переписывает URL в JSON-метаданных
      */
-    private function rewriteJsonUrls(string $content, Request $request): string {
+    private function rewriteJsonUrls(string $content, Request $request): string
+    {
         $data = json_decode($content, true);
         if (!$data) {
-            fwrite(STDERR, "[DEBUG] JSON decode failed\n");
+            $this->logger->error("[DEBUG] JSON decode failed");
             return $content;
         }
 
@@ -476,7 +480,7 @@ class ComposerProxyHandler
             $original = $data['metadata-url'];
             $data['metadata-url'] = preg_replace('#https?://[^/]+#', $baseUrl, $original);
             if ($data['metadata-url'] !== $original) {
-                fwrite(STDERR, "[DEBUG] Rewrote metadata-url: {$original} -> {$data['metadata-url']}\n");
+                $this->logger->debug("[DEBUG] Rewrote metadata-url: {$original} -> {$data['metadata-url']}");
                 $replacedCount++;
             }
         }
@@ -496,14 +500,15 @@ class ComposerProxyHandler
         // Рекурсивно переписываем URL архивов
         $this->rewriteUrlsRecursive($data, $baseUrl, $replacedCount);
 
-        if ($replacedCount > 0) {
-            fwrite(STDERR, "[DEBUG] Total rewritten: {$replacedCount} URLs\n");
-        }
+        /*if ($replacedCount > 0) {
+            $this->logger->debug("[DEBUG] Total rewritten: {$replacedCount} URLs");
+        }*/
 
         return json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     }
 
-    private function rewriteUrlsRecursive(mixed &$data, string $baseUrl, int &$count): void {
+    private function rewriteUrlsRecursive(mixed &$data, string $baseUrl, int &$count): void
+    {
         if (is_array($data)) {
             foreach ($data as &$value) {
                 $this->rewriteUrlsRecursive($value, $baseUrl, $count);

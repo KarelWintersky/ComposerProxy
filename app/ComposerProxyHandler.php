@@ -22,7 +22,6 @@ class ComposerProxyHandler
     private PDO $pdo;
     private object $httpClient;
     private array $config;
-    private App $app;
     private LoggerInterface $logger;
 
     public function __construct(PDO $pdo, object $httpClient, array $config, LoggerInterface $logger)
@@ -30,7 +29,6 @@ class ComposerProxyHandler
         $this->pdo = $pdo;
         $this->httpClient = $httpClient;
         $this->config = $config;
-        $this->app = App::getInstance();
         $this->logger = $logger;
     }
 
@@ -154,7 +152,7 @@ class ComposerProxyHandler
                 ], $content);
             }
 
-            $this->logger->debug("[DEBUG] MISS: {$targetUrl}");
+            $this->logger->notice("[DEBUG] MISS: {$targetUrl}");
 
             // 2. Скачивание с upstream
             $clientRequest = new ClientRequest($targetUrl);
@@ -336,7 +334,7 @@ class ComposerProxyHandler
                 });
 
                 // $this->logger->debug("[DEBUG] Archive HIT: {$targetUrl}");
-                $this->logger->debug("[DEBUG] Archive HIT: {$cacheRow['file_path']}.zip");
+                $this->logger->notice("[DEBUG] Archive HIT: {$cacheRow['file_path']}");
                 $file = openFile($cacheRow['file_path'], 'r');
                 return new Response(200, [
                     'content-type' => $cacheRow['content_type'] ?: 'application/octet-stream',
@@ -344,7 +342,7 @@ class ComposerProxyHandler
                 ], $file);
             }
 
-            $this->logger->debug("[DEBUG] Archive MISS: {$targetUrl}");
+            $this->logger->notice("[DEBUG] Archive MISS: {$targetUrl}");
 
             // Получаем ВСЕ данные из маппинга
             $mappingFuture = async(function () use ($targetUrl) {

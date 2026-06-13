@@ -1,0 +1,47 @@
+{
+    "chmod": "0755",
+    "compactors": [
+        "KevinGH\\Box\\Compactor\\Php",
+        "KevinGH\\Box\\Compactor\\Json"
+    ],
+    "compression": "GZ",
+    "main": "server.php",
+    "output": "composer-proxy.phar",
+    "finder": [
+        {
+            "name": "*.php",
+            "in": ["app"],
+            "exclude": ["tests"]
+        },
+        {
+            "name": ["*.php", "*.json", "*.h", "*.so", "*.dll", "*.html"],
+            "in": "vendor",
+            "exclude": [
+                ".github",
+                ".editorconfig",
+                "infection.json.dist",
+                ".php-cs-fixer.dist.php",
+                ".valgrindc",
+                "*.exe",
+                "*.md",
+                "LICENSE",
+                "psalm.xml",
+                "test",
+                "tests",
+                "Tests",
+                "examples",
+                ".gitignore",
+                ".hhconfig",
+                ".travis*",
+                "phpunit*",
+                "docs",
+                "doc"
+            ]
+        }
+    ],
+    "files": [
+        "server.php"
+    ],
+    "dump-autoload": true,
+    "check-requirements": false
+}

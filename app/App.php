@@ -195,7 +195,9 @@ class App implements RequestHandler
     {
         if ($this->proxyHandler === null) {
             $httpClient = \Amp\Http\Client\HttpClientBuilder::buildDefault();
-            $this->proxyHandler = new ComposerProxyHandler($this->getPDO(), $httpClient, $this->config);
+            $logger = new ConsoleLogger();
+
+            $this->proxyHandler = new ComposerProxyHandler($this->getPDO(), $httpClient, $this->config, $logger);
         }
         return $this->proxyHandler;
     }

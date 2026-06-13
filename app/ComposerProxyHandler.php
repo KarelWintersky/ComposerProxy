@@ -22,12 +22,16 @@ class ComposerProxyHandler
     private PDO $pdo;
     private object $httpClient;
     private array $config;
+    private App $app;
+    private LoggerInterface $logger;
 
-    public function __construct(PDO $pdo, object $httpClient, array $config)
+    public function __construct(PDO $pdo, object $httpClient, array $config, LoggerInterface $logger)
     {
         $this->pdo = $pdo;
         $this->httpClient = $httpClient;
         $this->config = $config;
+        $this->app = App::getInstance();
+        $this->logger = $logger;
     }
 
     /**
@@ -80,10 +84,8 @@ class ComposerProxyHandler
     /**
      * Извлекает vendor/package из URL и формирует путь к файлу
      */
-    /**
-     * Извлекает vendor/package из URL и формирует путь к файлу
-     */
-    private function getCachePath(string $url, string $type): string {
+    private function getCachePath(string $url, string $type): string
+    {
         // Корневой packages.json
         if (preg_match('~/packages\.json$~', $url)) {
             return $this->config['cache_dir'] . '/package.json';

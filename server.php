@@ -16,29 +16,91 @@ use Amp\Socket\ResourceServerSocketFactory;
 use App\ComposerProxyHandler;
 use App\ConsoleLogger;
 use App\Router;
+use App\Setup;
 use App\StatsHandler;
 use Psr\Log\NullLogger;
 use function Amp\trapSignal;
 
 // --- Загрузка конфигурации ---
-// Приоритет: переменная окружения > конфиг рядом с server.php
-$configPath = getenv('COMPOSER_PROXY_CONFIG') ?: (__DIR__ . '/config.php');
+// Приоритет: CLI --config > ENV > /etc > рядом с PHAR > рядом с server.php
 
-if (!file_exists($configPath)) {
-    fwrite(STDERR, "❌ Config not found at: {$configPath}\n");
-    fwrite(STDERR, "   Set COMPOSER_PROXY_CONFIG env variable or place config.php next to server.php\n");
+// --- 1. Парсинг аргументов CLI ---
+$cliConfigPath = null;
+$isInstallMode = false;
+
+foreach ($argv as $i => $arg) {
+    if (str_starts_with($arg, '--config=')) {
+        $cliConfigPath = substr($arg, strlen('--config='));
+    } elseif ($arg === '--install') {
+        $isInstallMode = true;
+    }
+}
+
+// --- 2. Определение пути к конфигу ---
+$configPath = $cliConfigPath ?? getenv('COMPOSER_PROXY_CONFIG') ?: null;
+
+if (!$configPath) {
+    $candidates = [
+        '/etc/composer-proxy/config.php',
+        dirname(Phar::running() ?: __FILE__) . '/config.php',
+        __DIR__ . '/config.php',
+    ];
+    foreach ($candidates as $candidate) {
+        if (file_exists($candidate)) {
+            $configPath = $candidate;
+            break;
+        }
+    }
+}
+
+// Если конфиг не найден, но мы в режиме установки — ошибка
+if (!$configPath || !file_exists($configPath)) {
+    fwrite(STDERR, "❌ Config not found.\n");
+    fwrite(STDERR, "   Usage: composer-proxy --config=/path/to/config.php [--install]\n");
     exit(1);
 }
 
 $config = require $configPath;
 
-// Валидация обязательных параметров
-$requiredKeys = ['listen', 'default_upstream', 'cache_dir', 'db_path', 'default_ttl', 'archive_ttl', 'stats_token'];
-foreach ($requiredKeys as $key) {
-    if (!isset($config[$key])) {
-        fwrite(STDERR, "❌ Missing required config key '{$key}' in {$configPath}\n");
+// --- 3. Режим установки (--install) ---
+if ($isInstallMode) {
+    echo "*** Running installation mode...\n";
+
+    // Валидация конфига перед установкой
+    if (!Setup::validateConfig($config)) {
         exit(1);
     }
+
+    try {
+        // Создаем временное PDO подключение для инициализации
+        // Setup::init сам создаст директории и таблицы
+        $pdo = new PDO('sqlite:' . $config['db_path'], null, null, [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        ]);
+
+        Setup::initDatabase($config, $pdo);
+        Setup::initStorage($config);
+
+        echo "\n";
+        echo "✓ Installation complete!\n";
+        $f = __FILE__;
+        echo "\nTo start the server, run {$f} without --install\n\n";
+        echo "WITH --config={$configPath} \n";
+        echo "OR   COMPOSER_PROXY_CONFIG={$configPath} env variable\n";
+        echo "OR   place config.php in /etc/composer-proxy/ or next to PHAR directory\n";
+        echo "\n";
+
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "❌ Installation failed: " . $e->getMessage() . "\n");
+        exit(1);
+    }
+
+    exit(0); // Завершаем работу после установки
+}
+
+// Валидация обязательных параметров
+if (!Setup::validateConfig($config)) {
+    exit(1);
 }
 
 // Проверка директорий
